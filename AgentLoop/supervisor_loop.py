@@ -1,866 +1,885 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from pydantic import BaseModel
 
+from pydantic import BaseModel, Field, field_validator
 
 from AgentLoop.loop_utils import (
+    DESCRIPTION_MAX_CHARS,
+    USER_QUERY_MAX_CHARS,
+    bounded_text,
     build_model_messages,
+    build_tool_observation_messages,
     call_chat_function,
     normalize_tool_calls,
-    parse_json_object
+    parse_json_object,
 )
-from MCP_functions.tool_registry import AgentRole,ToolRegistry
+from MCP_functions.tool_registry import AgentRole, ToolRegistry
+from State.save_executor_state_history import save_executor_review
 from State.save_supervision_state_history import save_supervisor_state_history
 
 if TYPE_CHECKING:
-    from AgentLoop.agent import AgentState,SupervisorState,ExecutorState,Skill,SupervisorEvaluationState
-from Context.History_Resorce.mcp_history_error import read_history_by_seq
+    from AgentLoop.agent import (
+        AgentState,
+        ExecutorState,
+        Skill,
+        SupervisorEvaluationState,
+        SupervisorState,
+    )
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PLAN_SKILL_PATH = PROJECT_ROOT / "Skills" / "supervisor_plan.md"
+
 SUPERVISOR_EVALUATION_PROMPT = """
-现在给你输出的字段有一下信息：
-1.target：当前阶段的总目标
-2.executor_target：前一轮executor要执行的目标
-3.executor_results：前一轮executor最终执行的结果（历程）
-4.executor_passed_seqs：前一轮executor操作的轮次的编号集合
-5.executor_is_error：前一轮executor执行问题过程中是否出现error
-6.executor_error_message:前一轮executor执行问题过程中error的信息
-7.skills代表你可以选择的skill列表
-8.supervisor_history代表历史你的思考记忆
-
-
-你需要:
-1.根据executor_results的字段信息和executor_target判断executor是否完成安排给它的任务
-2.再判断是否达到了target的总目标
-3.再检查executor_is_error字段是不是false,若为false，代表executor执行问题过程中没有问题，如果1，2里面的条件都满足，评估结果为通过，
-准备进行下一轮问题的规划,is_passed返回true字段
-4.如果executor_is_error是false,1条件达到了但2没有达到，则需要你在is_passed返回false，并在reason字段上给出你得出此判断的理由。
-1，2都没达到的话同理
-5.executor_is_error是true的话，锁定executor_passed_seqs里面的内容，尤其检查最后一项。可以通过read_history_by_seq来搜索result_content和
-tool_name，查看这一轮到底发生了什么导致出错。当哪一轮你没有返回这个字段的时候，我默认你已经找到问题所在了，我会自动进入下一个work环节，所以，
-在没有找到问题之前，一定要记得返回字段并且调用read_history_by_seq这个工具。实在找不到问题的时候，可以调用memory_retrieval.md这个skill，
-按照skill里面的任务流来帮助你解决问题
-6.在你执行完上述的操作后，is_finished返回true，代表supervisor的evaluation结束了，否则返回false
-
-注意：
-每轮都需要返回"description"字段，用来总结这一回合你干了什么
-返回json格式要求如下：
+你是 Supervisor 的 evaluation 阶段，只验收上一轮 Executor 的委派目标，不推进 task。
+必须检查真实工具结果和必要验证证据；Executor 自报完成、工具无报错都不能代替证据。
+委派子目标完成可以 is_passed=true，即使整个 task 尚未完成；整个 task 是否推进由 decision 阶段判断。
+需要历史时只能调用本轮提供的只读工具，精确查询使用 read_task_error。
+每步最多调用一个工具。信息不足且仍需查询时 is_finished=false；形成明确验收结论时才为 true。
+最终仅输出 JSON：
 {
-    "is_passed":"",
-    "description":"",
-    "is_error":false,
-    "reason":"",
-    "needed_check":{
-        "seq_num":"",
-        "chat_id":"",
-    },
-    "skill":{
-        "skill_id":"",
-        "skill_name":""
-    },
-    "is_finished":false
-}   
+  "is_passed": false,
+  "description": "本轮核验事实与证据",
+  "is_error": false,
+  "reason": "未通过或受阻原因",
+  "needed_check": {"session_address": "", "chat_id": "", "task_id": 0, "seq": 0},
+  "skill": {"skill_id": null, "skill_name": null},
+  "is_finished": true
+}
 """
 
 SUPERVISOR_DECISION_PROMPT = """
-输入格式为:
+你是 Supervisor 的 decision 阶段。evaluation 结论已给出。
+你负责决定当前 task 是否推进、给出下一轮 Executor 指导，必要时仅调整尚未完成的计划后缀。
+不得绕过 evaluation 的否决；回溯只用于重新指导，不回滚磁盘、不重放旧工具。
+is_next_target=true 仅表示当前整个 task 已满足完成条件。最后一个 task 完成时给出 final_answer。
+若 is_finished=false，表示本决策仍需查询；形成明确决策后必须为 true。
+最终仅输出 JSON：
 {
-    "session_address":"",
-    "chat_id":"",
-    "task_list":"",
-    "now_task_id":"",
-    "now_target":"",
-    "executor_target" : "",
-    "supervisor_evaluation_result":"",
-    "executor_is_passed":"",
-    "executor_not_pass_reason":"",
-    "executor_is_error":"",
-    "executor_error_message":"",
-    "memory_window":""
-}
-
-其中
-task_List:总的任务清单
-task_id:进行到第几个任务了
-now_target:当前的任务名称
-executor_target:代表上一轮executor执行的任务目标，
-supervisor_evaluation_result:supervisor对executor执行完任务结果后的反馈
-executor_is_passed:supervisor:评估当前回合executor是否按照要求完成任务
-executor_not_pass_reason:supervisor给出的他对executor为什么没有完成任务的说明总结
-executor_is_error:supervisor检查在executor执行任务的过程里面有没有出问题
-executor_error_message:supervisor对于executor执行任务报错的说明
-memory_window:在前几轮轮回合中supervisor已经执行了哪些操作
-
-
-1.如果executor_is_passed为true，代表executor任务执行完毕，然后你需要结合now_target和supervisor_evaluation_result给出判断，
-如果全部完成，进入下一步，is_next_target字段返回true,结合task_id+1对应的任务，给出下一个步骤的指导。否则返回false,然后结合now_target，
-给出下一步指令。此外，如果发现task_list需要修改，将is_task_list_need_change返回为true，并在new_task_list给出新的task_list
-***不到万不得已不要修改task_list****
-2.如果executor_is_error为true，先结合executor_error_message的字段信息和now_target，给出解决方案
-3.如果executor_is_passed为false，你可以结合当前supervisor_evaluation_result，判断需不需要回溯，需要的话need_date_back返回true，
-并给出返回的seq序列号和task_id号
-
-返回格式要求如下:
-
-"is_finished":代表本次结束，进入executor操作轮次,结束返回true，没结束返回false
-"description":""字段代表对于这轮操作你给出的总结
-date_back_input:通过工具read_history_by_seq查询date_back_location里面所有的内容最后写的input的总结，改从什么地方重新开始执行任务
-
-{
-    "is_next_target":"",
-    "is_task_list_need_change":"",
-    "new_task_list":"",
-    "next_executor_target":"",
-    "need_date_back":"",
-    "description":"",
-    "is_finished":""
-    "date_back_location":[
-            {"seq":"",
-        "task_id":"",
-        "chat_id":"",
-        "session_address":""}
-        ],
-    "date_back_input":""
+  "is_task_list_need_change": false,
+  "new_task_list": [],
+  "is_next_target": false,
+  "next_executor_target": "下一轮具体操作与验证要求",
+  "need_date_back": false,
+  "description": "决策依据",
+  "is_finished": true,
+  "date_back_location": [],
+  "date_back_input": "",
+  "modify_content": "",
+  "verification_requirement": "",
+  "final_answer": ""
 }
 """
 
+
+class PlanningResult(BaseModel):
+    task_list: list[str]
+    description: str = ""
+    executor_guidance: str | None = None
+
+    @field_validator("task_list")
+    @classmethod
+    def validate_tasks(cls, value):
+        tasks = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if not tasks:
+            raise ValueError("task_list must contain at least one non-empty task")
+        return tasks
+
+
+class InitialGuidance(BaseModel):
+    description: str = ""
+    executor_guidance: str
+    completion_criteria: str
+
+
 class NeededCheck(BaseModel):
-    seq_num:int | None =None
-    chat_id:str| None =None
+    session_address: str | None = None
+    chat_id: str | None = None
+    task_id: int | None = None
+    seq: int | None = None
+
 
 class SupervisorSkill(BaseModel):
-    skill_id:int| None =None
-    skill_name:str| None =None
-class SupervisorEvaluation(BaseModel):
-    is_passed: bool | None = False
+    skill_id: int | None = None
+    skill_name: str | None = None
 
-    description: str | None = None
-    is_error:bool | None = False
-    reason: str | None = None
+
+class SupervisorEvaluation(BaseModel):
+    is_passed: bool = False
+    description: str = ""
+    is_error: bool = False
+    reason: str = ""
     needed_check: NeededCheck | None = None
     skill: SupervisorSkill | None = None
-    is_finished: bool | None = False
+    is_finished: bool = False
+
 
 class DateBack(BaseModel):
-    seq:int
-    task_id:int
-    chat_id:int
-    session_address:str
+    seq: int
+    task_id: int
+    chat_id: str
+    session_address: str
+
 
 class SupervisorDecisionResult(BaseModel):
+    is_task_list_need_change: bool = False
+    new_task_list: list[str] = Field(default_factory=list)
+    is_next_target: bool = False
+    next_executor_target: str = ""
+    need_date_back: bool = False
+    description: str = ""
+    is_finished: bool = False
+    date_back_location: list[DateBack] = Field(default_factory=list)
+    date_back_input: str = ""
+    modify_content: str = ""
+    verification_requirement: str = ""
+    final_answer: str = ""
 
-    is_task_list_need_change: bool | None = False
-    new_task_list: list[str] | None = []
-    is_next_target: bool | None = False
-    next_executor_target:str | None = None
-    need_date_back: bool | None = False
-    description: str | None = None
-    is_finished: bool | None = False
-    date_back_location: DateBack | None = None
-    date_back_input:str | None = None
+
+class SupervisorHistorySummary(BaseModel):
+    description: str
 
 
 async def supervisor_making_plan(
-        query:str,
-        now_state:AgentState,
-        chat_function,
-        client,
-        tool_registry: ToolRegistry,
-        supervisor:str,
-        supervisor_tools:list[dict],
-        supervisor_state:SupervisorState
+    query: str,
+    now_state: AgentState,
+    chat_function,
+    client,
+    tool_registry: ToolRegistry,
+    supervisor: str,
+    supervisor_tools: list[dict],
+    supervisor_state: SupervisorState,
+    executor_tools: list[dict] | None = None,
+    skill_lists: list[Skill] | None = None,
 ):
-    skill_content = _load_planning_skill()
-    information = {}
+    supervisor_state.memory_window = []
+    information = {
+        "user_query": bounded_text(query, USER_QUERY_MAX_CHARS),
+        "session_address": now_state.session_address,
+        "chat_id": now_state.chat_id,
+        "executor_tools": _tool_catalog(executor_tools or []),
+        "skill_info": _skill_catalog(skill_lists or []),
+    }
+    prompt = _load_planning_skill()
 
-    if query is not None:
-        information["user_query"] = query
-    information["session_address"] = now_state.session_address
-    information["chat_id"] = now_state.chat_id
-    planning_times = 0
-
-    while planning_times < now_state.max_supervision_times:
-        if len(supervisor_state.memory_window) > 0:
-            information["have_been_finished"] = supervisor_state.memory_window
-
-        message = build_model_messages(
-            provider=supervisor,
-            prompt=skill_content if skill_content is not None else _load_planning_prompt(),
-            information=information
+    for _ in range(now_state.max_supervision_times):
+        messages = build_model_messages(supervisor, prompt, information)
+        response = await _call_supervisor_model(
+            now_state, chat_function, client, supervisor, messages, supervisor_tools
         )
-
-        try:
-            response =  call_chat_function(
-                chat_function=chat_function,
-                provider=supervisor,
-                client=client,
-                model = now_state.supervisor_model,
-                messages=message,
-                tools=supervisor_tools,
-                temperature=now_state.temperature
+        if response["status"] != "success":
+            supervisor_state.exit_reason = "planning_model_error"
+            raise RuntimeError(response.get("message") or "planning model request failed")
+        calls = normalize_tool_calls(supervisor, response["tool"])
+        if len(calls) > 1:
+            information["last_feedback"] = (
+                "一次只能调用一个工具；上一响应未执行任何工具。"
             )
-
-            if response.get("status") == "error":
-                raise ValueError(response.get("message"))
-
-            if len(response.get("tool") == 0):
-                response_info = parse_json_object(response.get("message"))
-                if "task_list" not in response_info:
-                    raise ValueError("the info : task_list field not found in the message")
-
-                task_list = response_info["task_list"]
-                now_state.task_list = task_list
-                now_state.supervisor_seq = planning_times + 1
-
-                supervisor_state.output_content = task_list
-                supervisor_state.executor_plan = now_state.task_list[0]
-                save_supervisor_state_history(supervisor_state)
-                return
-
-            tool_calls = normalize_tool_calls(
-                provider=supervisor,
-                tool_calls = response.get("tool")
+            continue
+        if not calls:
+            result = PlanningResult.model_validate(
+                parse_json_object(response.get("message"))
             )
-
-            tool_call = tool_calls[0]
-
-            tool_result = await tool_registry.call(
-                role=AgentRole.SUPERVISOR,
-                tool_name=tool_call.name,
-                arguments=tool_call.arguments
+            _apply_plan(now_state, supervisor_state, result)
+            _save_supervisor_turn(
+                now_state, supervisor_state, "planning", result.description
             )
-
-            message.append(
-                {
-                    "role":"user",
-                    "content":f"tool_results:{tool_result}"
-                }
+            await _prepare_initial_guidance(
+                now_state,
+                supervisor_state,
+                chat_function,
+                client,
+                supervisor,
             )
+            return result
 
-            try:
+        call = calls[0]
+        tool_result = await tool_registry.call(
+            AgentRole.SUPERVISOR, call.name, call.arguments
+        )
+        _save_supervisor_tool_event(
+            now_state, supervisor_state, call.name, call.arguments, tool_result, "planning"
+        )
+        messages.extend(
+            build_tool_observation_messages(
+                supervisor, response.get("message"), call, tool_result
+            )
+        )
+        summary = await _call_supervisor_model(
+            now_state, chat_function, client, supervisor, messages, []
+        )
+        if summary["status"] != "success":
+            information["last_feedback"] = "历史工具已执行，但规划总结失败；不要重复调用。"
+            information["latest_tool_observation"] = tool_result.to_dict()
+            continue
+        result = PlanningResult.model_validate(
+            parse_json_object(summary.get("message"))
+        )
+        _apply_plan(now_state, supervisor_state, result)
+        _save_supervisor_turn(now_state, supervisor_state, "planning", result.description)
+        await _prepare_initial_guidance(
+            now_state,
+            supervisor_state,
+            chat_function,
+            client,
+            supervisor,
+        )
+        return result
 
-                second_response = call_chat_function(
-                    chat_function=chat_function,
-                    provider=supervisor,
-                    client=client,
-                    model = now_state.supervisor_model,
-                    messages=message,
-                    tools=supervisor_tools,
-                    temperature=now_state.temperature
-                )
+    supervisor_state.exit_reason = "planning_limit"
+    raise RuntimeError("Supervisor planning did not produce a valid non-empty task list")
 
-                if second_response.get("status") == "error":
-                    raise ValueError("there may occur some problems when model plan")
-
-                second_response_info = parse_json_object(second_response.get("message"))
-                supervisor_state.memory_window.append(
-                    f"第{planning_times + 1}轮，已完成{second_response_info.get("description")}"
-                )
-
-                now_state.supervisor_seq += 1
-                planning_times += 1
-                save_supervisor_state_history(supervisor_state)
-                if "task_list" in second_response_info and len(second_response_info["task_list"]) > 0:
-                    now_state.task_list = second_response_info["task_list"]
-                    supervisor_state.executor_plan = now_state.task_list[0]
-                    supervisor_state.output_content = second_response_info["task_list"]
-                    return
-
-            except Exception as e:
-                print("未得到模型回答，检查连接情况")
-                raise e
-
-        except RuntimeError as error:
-            print("未得到模型回答，检查连接情况")
-            raise error
-
-        except ValueError as error:
-            print("模型解析失败")
-            raise error
-
-
-#supervisor轮一共要干两件事情：1.评估executor这一轮干的活 2.判断下一回合的目标，task_id移动不移动
 
 async def run_supervisor_loop(
-        now_state: AgentState,
-        supervisor: str,
+    now_state: AgentState,
+    supervisor: str,
+    supervisor_client,
+    chat_function,
+    supervisor_tools: list[dict],
+    tool_registry: ToolRegistry,
+    skill_lists: list[Skill],
+    supervisor_state: SupervisorState,
+    supervisor_evaluation_state: SupervisorEvaluationState,
+    executor_state: ExecutorState,
+):
+    _reset_supervisor_turn(now_state, supervisor_state, supervisor_evaluation_state)
+    supervisor_state.reviewed_executor_seqs = list(executor_state.passed_seq_list)
+    evaluation = await evaluation_loop(
+        now_state,
+        supervisor,
         supervisor_client,
         chat_function,
-        supervisor_tools: list[dict],
-        tool_registry: ToolRegistry,
-        skill_lists: list[Skill],
-        supervisor_state: SupervisorState,
-        supervisor_evaluation_state:SupervisorEvaluationState,
-        executor_state: ExecutorState
-):
-
-    supervisor_run_times = 0
-
-    supervisor_state.memory_window = []
-
-    await evaluation_loop(
-        now_state=now_state,
-        supervisor=supervisor,
-        supervisor_client=supervisor_client,
-        chat_function=chat_function,
-        supervisor_tools=supervisor_tools,
-        tool_registry=tool_registry,
-        skill_lists=skill_lists,
-        supervisor_state=supervisor_state,
-        supervisor_evaluation_state=supervisor_evaluation_state,
-        executor_state=executor_state
+        supervisor_tools,
+        tool_registry,
+        skill_lists,
+        supervisor_state,
+        supervisor_evaluation_state,
+        executor_state,
     )
-
-    await making_next_plan_loop(
-        now_state = now_state,
-        supervisor=supervisor,
-        supervisor_client=supervisor_client,
-        chat_function=chat_function,
-        supervisor_tools=supervisor_tools,
-        tool_registry=tool_registry,
-        supervisor_state=supervisor_state,
-        supervisor_evaluation_state=supervisor_evaluation_state,
-        executor_state=executor_state
+    save_executor_review(
+        supervisor_state,
+        list(executor_state.passed_seq_list),
+        evaluation.is_passed,
+        evaluation.reason,
     )
-
-    return
-
-async def making_next_plan_loop(
-        now_state: AgentState,
-        supervisor: str,
+    decision = await making_next_plan_loop(
+        now_state,
+        supervisor,
         supervisor_client,
         chat_function,
-        supervisor_tools: list[dict],
-        tool_registry: ToolRegistry,
-        supervisor_state: SupervisorState,
-        supervisor_evaluation_state: SupervisorEvaluationState,
-        executor_state: ExecutorState
-):
-    supervisor_evaluation_state.memory_window = []
-
-    primary_message = _build_decision_message(
-        now_state=now_state,
-        supervisor_state=supervisor_state,
-        supervisor_evaluation_state=supervisor_evaluation_state,
-        executor_state=executor_state,
-        supervisor=supervisor
+        supervisor_tools,
+        tool_registry,
+        supervisor_state,
+        supervisor_evaluation_state,
+        executor_state,
     )
-
-    output_content = ""
-    supervisor_executing_times = 0
-    while supervisor_executing_times < now_state.max_supervision_times:
-        message = _build_decision_message(
-            now_state=now_state,
-            supervisor_state=supervisor_state,
-            supervisor_evaluation_state=supervisor_evaluation_state,
-            executor_state=executor_state,
-            supervisor=supervisor
-        )
-
-        try:
-            response = call_chat_function(
-                chat_function=chat_function,
-                provider=supervisor,
-                client=supervisor_client,
-                model = now_state.supervisor_model,
-                messages=message,
-                tools=supervisor_tools,
-                temperature=now_state.temperature
-            )
-
-            if response.get("status") == "error":
-                raise ValueError("there may occur some problems when model deals with queries")
-
-            tools = response.get("tool", {})
-            if tools == {}:
-
-                content = SupervisorDecisionResult.model_validate(
-                    parse_json_object(
-                        response.get("message")
-                    )
-                )
-                supervisor_state.supervisor_seq += 1
-                supervisor_state.executor_plan = content.next_executor_target
-                supervisor_state.need_date_back = content.need_date_back
-                supervisor_state.date_back_input = content.date_back_input
-
-                now_state.supervisor_seq = supervisor_state.supervisor_seq
-                if content.is_task_list_need_change:
-                    now_state.task_list = content.new_task_list
-
-                if content.is_next_target:
-                    now_state.now_task_id += 1
-                    now_state.now_target = now_state.task_list[now_state.now_task_id]
-
-                now_state.supervisor_input = primary_message
-                now_state.supervisor_output = output_content
-
-                return
-
-            tool_calls = normalize_tool_calls(
-                provider=supervisor,
-                tool_calls=tools
-            )
-
-            tool_call = tool_calls[0]
-
-            tool_result = await tool_registry.call(
-                role=AgentRole.SUPERVISOR,
-                tool_name=tool_call.name,
-                arguments=tool_call.arguments
-            )
-
-            message.append(
-                {
-                    "role": "user",
-                    "content": f"tool_results:{tool_result}"
-                }
-            )
-            try:
-                second_response = call_chat_function(
-                    chat_function=chat_function,
-                    provider=supervisor,
-                    client=supervisor_client,
-                    model = now_state.supervisor_model,
-                    messages=message,
-                    tools=[],
-                    temperature=now_state.temperature
-                )
-                supervisor_executing_times += 1
-                supervisor_state.supervisor_seq += 1
-
-                if second_response.get("status") == "error":
-                    raise ValueError("there may occur some problems when model deals with queries")
-
-                response_content = parse_json_object(second_response.get("message"))
-                content = SupervisorDecisionResult.model_validate(response_content)
-
-                supervisor_state.memory_window.append(content.description)
-                output_content += f"第{supervisor_executing_times}轮已经完成{content.description}"
-
-                supervisor_state.output_content = output_content
-                supervisor_state.tool_name = tool_call.name
-                supervisor_state.tool_result = tool_result
-                supervisor_state.input_content = message
-
-                save_supervisor_state_history(supervisor_state)
-
-                if content.is_finished:
-                    supervisor_state.executor_plan = content.next_executor_target
-                    supervisor_state.need_date_back = content.need_date_back
-                    supervisor_state.date_back_input = content.date_back_input
-
-                    now_state.supervisor_seq = supervisor_state.supervisor_seq
-                    if content.is_task_list_need_change :
-                        now_state.task_list = content.new_task_list
-
-                    if content.is_next_target :
-                        now_state.now_task_id +=1
-                        now_state.now_target = now_state.task_list[now_state.now_task_id]
-
-
-                    now_state.supervisor_input = primary_message
-                    now_state.supervisor_output = output_content
-
-                    return
-
-            except Exception as e:
-                raise e
-
-        except Exception as e:
-            raise e
-def _build_decision_message(
-        now_state:AgentState,
-        supervisor_state: SupervisorState,
-        supervisor_evaluation_state:SupervisorEvaluationState,
-        executor_state:ExecutorState,
-        supervisor:str
-):
-    task_id = now_state.now_task_id
-    task_list = now_state.task_list
-
-    executor_target = executor_state.input_content
-    supervisor_evaluation_result = supervisor_evaluation_state.output_content
-    supervisor_evaluation_executor_is_error = supervisor_evaluation_state.is_executor_error
-    executor_is_passed = supervisor_evaluation_state.is_executor_passed
-    executor_error_message = supervisor_evaluation_state.executor_error_message
-    executor_not_pass_reason = supervisor_evaluation_state.not_pass_reason
-    infos = {}
-
-    infos["session_address"] = now_state.session_address
-    infos["chat_id"] = now_state.chat_id
-    infos["target_list"] = task_list
-    infos["now_task_id"] = task_id
-    infos["now_task"] = task_list[task_id]
-    infos["executor_target"] = executor_target if executor_target else None
-    infos["supervisor_evaluation_result"] = supervisor_evaluation_result if supervisor_evaluation_result else None
-    infos["executor_is_passed"] = executor_is_passed if executor_is_passed else False
-    infos["executor_not_pass_reason"] = executor_not_pass_reason if executor_not_pass_reason else None
-    infos["executor_is_error"] = supervisor_evaluation_executor_is_error if executor_is_passed else False
-    infos["executor_error_message"] = executor_error_message if executor_error_message else None
-    infos["memory_window"] = supervisor_state.memory_window
-
-    return build_model_messages(
-        provider=supervisor,
-        prompt=SUPERVISOR_DECISION_PROMPT,
-        information=infos
-    )
-
+    return decision
 
 
 async def evaluation_loop(
-        now_state: AgentState,
-        supervisor: str,
-        supervisor_client,
-        chat_function,
-        supervisor_tools: list[dict],
-        tool_registry: ToolRegistry,
-        skill_lists: list[Skill],
-        supervisor_state: SupervisorState,
-        supervisor_evaluation_state:SupervisorEvaluationState,
-        executor_state: ExecutorState
+    now_state: AgentState,
+    supervisor: str,
+    supervisor_client,
+    chat_function,
+    supervisor_tools: list[dict],
+    tool_registry: ToolRegistry,
+    skill_lists: list[Skill],
+    supervisor_state: SupervisorState,
+    supervisor_evaluation_state: SupervisorEvaluationState,
+    executor_state: ExecutorState,
 ):
-    supervisor_results = None
-    supervisor_run_times = 0
-
-    output_content = ""
-    supervisor_state.memory_window = []
-    primary_message = _build_supervisor_evaluation_message(
+    selected_skill = None
+    for _ in range(now_state.max_supervision_times):
+        messages = _build_supervisor_evaluation_message(
             executor_state,
-            now_state=now_state,
-            skill_list=skill_lists,
-            supervisor=supervisor,
-            supervisor_evaluation_state=supervisor_evaluation_state
+            now_state,
+            skill_lists,
+            supervisor,
+            supervisor_evaluation_state,
+            selected_skill,
         )
-    while (supervisor_run_times < now_state.max_supervision_times):
-        message = _build_supervisor_evaluation_message(
-            executor_state,
-            now_state=now_state,
-            skill_list=skill_lists,
-            supervisor=supervisor,
-            supervisor_evaluation_state=supervisor_evaluation_state
+        response = await _call_supervisor_model(
+            now_state,
+            chat_function,
+            supervisor_client,
+            supervisor,
+            messages,
+            supervisor_tools,
         )
-
-        try:
-            response =  call_chat_function(
-                chat_function=chat_function,
-                provider=supervisor,
-                client=supervisor_client,
-                model = now_state.supervisor_model,
-                messages=message,
-                tools=supervisor_tools,
-                temperature=now_state.temperature
+        if response["status"] != "success":
+            supervisor_evaluation_state.not_pass_reason = (
+                response.get("message") or "evaluation model request failed"
             )
-
-            if response.get("status") == "error":
-                raise ValueError("there may occur some problems when model deals with queries")
-
-            tools = response.get("tool",{})
-            if tools == {}:
-                supervisor_state.supervisor_seq += 1
-
-                _update_supervisor_evaluation_state(
-                    supervisor_evaluation_state=supervisor_evaluation_state,
-                    supervisor_state=supervisor_state,
-                    supervisor_results=supervisor_results,
-                    tool_name="",
-                    tool_results="",
-                    input_content=message,
-                    output_content=output_content
-                )
-                _update_Agent_state(
-                    now_state=now_state,
-                    SupervisorState=supervisor_state,
-                    message=primary_message
-                )
-                save_supervisor_state_history(supervisor_state)
-
-                return
-            tool_calls = normalize_tool_calls(
-                provider=supervisor,
-                tool_calls = tools
+            break
+        calls = normalize_tool_calls(supervisor, response["tool"])
+        if len(calls) > 1:
+            _evaluation_memory(
+                supervisor_evaluation_state,
+                "一次返回多个工具调用，未执行；请一次只查询一个。",
             )
+            continue
 
-            tool_call = tool_calls[0]
-
+        if not calls:
+            result = SupervisorEvaluation.model_validate(
+                parse_json_object(response.get("message"))
+            )
+        else:
+            call = calls[0]
             tool_result = await tool_registry.call(
-                role=AgentRole.SUPERVISOR,
-                tool_name=tool_call.name,
-                arguments=tool_call.arguments
+                AgentRole.SUPERVISOR, call.name, call.arguments
+            )
+            _save_supervisor_tool_event(
+                now_state,
+                supervisor_state,
+                call.name,
+                call.arguments,
+                tool_result,
+                "evaluation",
+            )
+            messages.extend(
+                build_tool_observation_messages(
+                    supervisor, response.get("message"), call, tool_result
+                )
+            )
+            summary = await _call_supervisor_model(
+                now_state,
+                chat_function,
+                supervisor_client,
+                supervisor,
+                messages,
+                [],
+            )
+            if summary["status"] != "success":
+                _evaluation_memory(
+                    supervisor_evaluation_state,
+                    "检查工具已执行，但总结失败；保留观察且不重复执行。",
+                )
+                continue
+            result = SupervisorEvaluation.model_validate(
+                parse_json_object(summary.get("message"))
             )
 
-            message.append(
-                {
-                    "role":"user",
-                    "content":f"tool_results:{tool_result}"
-                }
+        _apply_evaluation(supervisor_evaluation_state, supervisor_state, result)
+        loaded = _load_supervisor_skill(skill_lists, result.skill)
+        if loaded is not None:
+            selected_skill = loaded
+        _save_supervisor_turn(
+            now_state, supervisor_state, "evaluation", result.description
+        )
+        if result.is_finished:
+            return result
+
+    blocked = SupervisorEvaluation(
+        is_passed=False,
+        description="Supervisor 验收达到上限，未形成充分结论。",
+        is_error=True,
+        reason=(
+            supervisor_evaluation_state.not_pass_reason
+            or "evaluation budget exhausted"
+        ),
+        is_finished=True,
+    )
+    _apply_evaluation(supervisor_evaluation_state, supervisor_state, blocked)
+    supervisor_evaluation_state.blocked = True
+    _save_supervisor_turn(now_state, supervisor_state, "evaluation_blocked", blocked.description)
+    return blocked
+
+
+async def making_next_plan_loop(
+    now_state: AgentState,
+    supervisor: str,
+    supervisor_client,
+    chat_function,
+    supervisor_tools: list[dict],
+    tool_registry: ToolRegistry,
+    supervisor_state: SupervisorState,
+    supervisor_evaluation_state: SupervisorEvaluationState,
+    executor_state: ExecutorState,
+):
+    for _ in range(now_state.max_supervision_times):
+        messages = _build_decision_message(
+            now_state,
+            supervisor_state,
+            supervisor_evaluation_state,
+            executor_state,
+            supervisor,
+        )
+        response = await _call_supervisor_model(
+            now_state,
+            chat_function,
+            supervisor_client,
+            supervisor,
+            messages,
+            supervisor_tools,
+        )
+        if response["status"] != "success":
+            supervisor_state.exit_reason = (
+                response.get("message") or "decision model request failed"
+            )
+            break
+        calls = normalize_tool_calls(supervisor, response["tool"])
+        if len(calls) > 1:
+            supervisor_state.memory_window.append(
+                "一次返回多个工具调用，未执行；请一次只查询一个。"
+            )
+            continue
+        if not calls:
+            result = SupervisorDecisionResult.model_validate(
+                parse_json_object(response.get("message"))
+            )
+        else:
+            call = calls[0]
+            tool_result = await tool_registry.call(
+                AgentRole.SUPERVISOR, call.name, call.arguments
+            )
+            _save_supervisor_tool_event(
+                now_state,
+                supervisor_state,
+                call.name,
+                call.arguments,
+                tool_result,
+                "decision",
+            )
+            messages.extend(
+                build_tool_observation_messages(
+                    supervisor, response.get("message"), call, tool_result
+                )
+            )
+            summary = await _call_supervisor_model(
+                now_state,
+                chat_function,
+                supervisor_client,
+                supervisor,
+                messages,
+                [],
+            )
+            if summary["status"] != "success":
+                supervisor_state.memory_window.append(
+                    "决策查询工具已执行，但总结失败；不重复工具。"
+                )
+                continue
+            result = SupervisorDecisionResult.model_validate(
+                parse_json_object(summary.get("message"))
             )
 
-            try:
-                second_response = call_chat_function(
-                chat_function=chat_function,
-                provider=supervisor,
-                client=supervisor_client,
-                model = now_state.supervisor_model,
-                messages=message,
-                tools=supervisor_tools,
-                temperature=now_state.temperature
-            )
+        _validate_decision_plan(now_state, result)
+        _apply_decision(supervisor_state, result)
+        _save_supervisor_turn(now_state, supervisor_state, "decision", result.description)
+        if result.is_finished:
+            return result
 
-                supervisor_run_times += 1
-                supervisor_state.supervisor_seq += 1
-
-                if second_response.get("status") == "error":
-                    raise ValueError("there may occur some problems when model plan")
-
-                second_response_info = parse_json_object(second_response.get("message"))
-                try:
-
-                    supervisor_results = SupervisorEvaluation.model_validate(second_response_info)
-                    supervisor_evaluation_state.memory_window.append(
-                        f"第{supervisor_run_times + 1}次，执行{supervisor_results.description}"
-                    )
-
-                    output_content += (
-                        f"第{supervisor_run_times+1}轮"+
-                        f"完成{supervisor_results.description}+\n\n"
-                    )
-
-                    _update_supervisor_evaluation_state(
-                        supervisor_evaluation_state=supervisor_evaluation_state,
-                        supervisor_state=supervisor_state,
-                        supervisor_results=supervisor_results,
-                        tool_name=tool_call.name,
-                        tool_results=tool_result,
-                        input_content=message,
-                        output_content=output_content
-                    )
-
-                    save_supervisor_state_history(supervisor_state)
-
-                    if supervisor_results.is_finished or supervisor_run_times == now_state.max_supervision_times-1:
-                        _update_Agent_state(
-                            now_state=now_state,
-                            SupervisorState=supervisor_state,
-                            message=primary_message
-                        )
-
-                        return
-                except Exception as e:
-                    raise e
-
-            except Exception as e:
-                raise e
-
-        except RuntimeError as error:
-            raise error
-        except ValueError as error:
-            raise error
-
-def _load_planning_skill():
-    skill_address = Path(r"D:\pycharmcode\coding_agent\Skills\memory_retrieval.md")
-
-    if not skill_address.exists():
-        return
-
-    with open(skill_address, "r",encoding="utf-8") as skill_file:
-        skill_content = skill_file.read()
-
-    return skill_content
+    blocked = SupervisorDecisionResult(
+        is_next_target=False,
+        next_executor_target="Supervisor 决策未完成，需人工检查验收记录后继续。",
+        description="Supervisor 决策达到上限。",
+        is_finished=True,
+    )
+    supervisor_state.exit_reason = "decision_budget_exhausted"
+    _apply_decision(supervisor_state, blocked)
+    _save_supervisor_turn(now_state, supervisor_state, "decision_blocked", blocked.description)
+    return blocked
 
 
-def _load_planning_prompt():
-    return  """
-你是 coding agent 的 supervisor，负责理解用户需求，结合历史上下文和 executor 的实际工具能力，制定可执行、可验收的任务计划。
-在没有确定最终的task_list计划之前，都只输出[]，否则默认你已经完成task_list的决定
-输入信息：
-- user_query：当前用户需求。
-- session_address、chat_id：当前会话位置和聊天编号。
-- executor_tools：executor 当前已注册的工具名称、描述和参数。
-- skill_info：可用 skill 的名称和简介。
-- 当前计划与执行摘要：重新规划时提供。
-
-工作流程：
-
-1. 判断是否需要历史上下文
-   - 先判断当前输入是否足以明确目标、对象、约束和预期结果。
-   - 如果用户提到“继续”“之前的方案”“修改刚才的内容”等历史信息，且当前输入没有提供完整内容，调用 read_history_chat_resource(session_address)。
-   - 该工具读取整个会话目录，必须筛选当前 chat_id 对应的记录，只提取与本次需求有关的信息。
-   - 当前输入已经足够时，不重复读取历史。
-   - 历史要求与当前用户明确要求冲突时，以当前要求为准。
-   - 历史记录不足以确定关键需求时，不自行猜测，将缺失信息作为后续任务的前置条件。
-
-2. 明确本次目标
-   - 提取用户要完成的工作、涉及的项目或路径、必须遵守的约束以及预期交付物。
-   - 区分已经完成的内容与本次需要完成的内容。
-   - 不添加与用户目标无关的工作。
-
-3. 核对 executor 的能力
-   - 根据 executor_tools 判断哪些操作可以执行，以及需要哪些输入。
-   - skill_info 只提供工作方法，不代表额外的工具权限。
-   - 下面的工具说明仅用于理解能力；只有出现在当前 executor_tools 中的工具才能安排调用。
-   - 不把 MCP 服务名称当作工具名称，不虚构工具、参数或执行结果。
-   - 所需能力不可用时，明确阻塞原因和恢复执行的前置条件，不将其描述成当前可以直接执行的步骤。
-
-4. 按依赖关系拆分任务
-   - 先安排必要的信息收集，再安排实现、验证和结果交付。
-   - 每个任务围绕一个明确目标，可以包含多次相关工具调用。
-   - 不把每次工具调用都拆成独立任务，不固定任务数量。
-   - 每个任务说明：执行什么、操作对象、必要时使用什么工具、达到什么条件算完成。
-   - 工具的具体参数由 executor 根据实际情况填写，不编造未知路径或配置。
-
-5. 检查并输出计划
-   - 检查计划是否覆盖用户目标，任务之间的依赖是否合理。
-   - 完成条件必须能够通过实际结果判断，不能仅写“完成修改”“确保正确”。
-   - 验证范围应与用户目标相符；启动成功不能代替功能验证。
-   - 重新规划时保留仍然有效的已完成工作，只调整受影响或尚未完成的任务。
-   - 只制定计划，不声称计划中的操作已经执行。
-
-executor 工具说明：
-
-1. read_all_files_tool(home_address)
-   读取指定目录下的文件信息和可解码的文本内容。
-   当前实现传入单个文件时只返回文件信息，不返回正文。
-   读取时选择必要的项目目录或子目录。
-
-2. sort_files_by_suffix_tool(files)
-   按后缀分组 read_all_files_tool 返回的完整结果。
-   不会压缩或摘要文件内容。
-
-3. sort_files_by_mother_tool(files)
-   当前实现实际按后缀分组，不能用于判断父目录结构。
-
-4. judge_spring_project_tool(sorted_files_by_suffix)
-   根据分组后的配置和源码，静态判断是否为 Spring / Spring Boot 项目，并提取构建工具和 JDK 版本线索。
-   不能证明项目可以构建或启动。
-
-5. find_java_exe_tool(home_address)
-   在 Windows 指定目录下查找并检查 java.exe、javac.exe。
-   优先指定合理的搜索目录。
-
-6. run_java_get_feedback(code_address, jdk_location)
-   编译并运行不含 package 声明的独立 Java 源文件，返回执行反馈。
-   不用于构建完整 Spring Boot 项目。
-
-7. package_spring_boot_with_confirmation_tool(project_path, temp_path)
-   使用 Maven 或 Gradle 打包 Spring Boot 项目，并将 JAR 复制到目标目录。
-   当前实现使用交互式确认，与 stdio MCP 的输入存在冲突；接入方修复确认流程前，视为受阻能力。
-   打包成功不代表测试已经通过。
-
-8. check_spring_boot_startup_tool(java_path, jar_path, timeout)
-   启动 JAR，在限定时间内根据日志检查启动情况。
-   只能提供启动观察结果，不能代替接口或业务测试，也不用于持续运行服务。
-
-9. write_in_tool(file_address, code)
-   创建必要的父目录，并向目标文件追加文本。
-   当前实现是追加写入，不能作为覆盖或替换已有代码的工具。
-
-10. find_the_python_editor_tool(home_address)
-    在 Windows 指定目录下查找并检查 Python 解释器。
-    优先指定合理的搜索目录。
-
-11. run_code_get_feedback_tool(editor_address, code_path)
-    使用指定 Python 解释器运行脚本，返回输出、错误或超时信息。
-    当前执行超时为 10 秒，不适合直接运行长期服务。
-
-12. download_package_with_confirmation_tool(editor_address, package_name)
-    使用指定 Python 解释器安装依赖。
-    当前实现使用交互式确认，与 stdio MCP 的输入存在冲突；接入方修复确认流程前，视为受阻能力。
-
-13. get_needed_info_tool(needed)
-    当前实现仅返回传入的 needed，不会实际检索配置或补充信息。
-    不得依赖它获取缺失信息。
-
-外部 MCP 工具：
-- GitHub、浏览器和 Docker 的具体能力，以 executor_tools 实际列出的工具及参数为准。
-- 只有服务配置但没有已注册工具时，不能安排调用。
-- supervisor 可以依据 executor 的能力制定计划，但不能因此获得 executor 的执行权限。
-
-输出要求：
-- 需要读取历史时，先发起工具调用，收到结果后再完成规划。
-- 最终仅输出合法 JSON，不附加解释或 Markdown 代码块。
-- 只包含 task_list 字段，值为非空字符串列表。
-- 每个字符串是一项具体任务，按执行顺序排列。
-- `description`每轮都需要带上，负责对于你这一轮执行的操作，以及为什么选择这个操作等等方面进行总结，不能失去重点，但最好精炼
-输出格式：
-{
-  "task_list": [
-    "任务描述，包含操作对象、必要的工具和完成条件",
-    "下一项任务描述"
-  ],
-  "description":""
-}
+async def summarize_supervisor_descriptions(
+    now_state: AgentState,
+    supervisor_state: SupervisorState,
+    supervisor: str,
+    supervisor_client,
+    chat_function,
+    status: str,
+    answer: str,
+    block_reason: str,
+):
+    """Summarize bounded Supervisor turn descriptions without changing decisions."""
+    prompt = """
+你只负责总结本次 Agent 请求的 Supervisor 工作轨迹，不重新规划、不重新验收，也不调用工具。
+根据按顺序提供的 planning、initial_guidance、evaluation、decision 描述，概括：
+1. 计划与关键指导；
+2. 主要验收和决策结论；
+3. 最终是否完成；若受阻，说明尚缺什么。
+不得把未验证操作写成完成，不得编造工具结果。仅返回 JSON：
+{"description": "面向后续上下文恢复的精炼总结"}
 """
+    response = await _call_supervisor_model(
+        now_state,
+        chat_function,
+        supervisor_client,
+        supervisor,
+        build_model_messages(
+            supervisor,
+            prompt,
+            {
+                "user_query": bounded_text(
+                    now_state.user_query, USER_QUERY_MAX_CHARS
+                ),
+                "status": status,
+                "answer": bounded_text(answer, DESCRIPTION_MAX_CHARS),
+                "block_reason": block_reason,
+                "supervisor_descriptions": (
+                    now_state.supervisor_descriptions.model_context()
+                ),
+            },
+        ),
+        [],
+    )
+    if response["status"] != "success" or response["tool"]:
+        raise RuntimeError(
+            response.get("message") or "Supervisor final summary failed"
+        )
+    summary = SupervisorHistorySummary.model_validate(
+        parse_json_object(response.get("message"))
+    )
+    description = bounded_text(
+        summary.description, DESCRIPTION_MAX_CHARS, keep_tail=True
+    )
+    _save_supervisor_turn(
+        now_state, supervisor_state, "final_summary", description
+    )
+    return description
 
 
 def _build_supervisor_evaluation_message(
-        executor_state:ExecutorState,
-        now_state:AgentState,
-        skill_list:list[Skill],
-        supervisor:str,
-        supervisor_evaluation_state:SupervisorEvaluationState,
+    executor_state,
+    now_state,
+    skill_list,
+    supervisor,
+    supervisor_evaluation_state,
+    selected_skill=None,
 ):
-    now_target = now_state.now_target
-    executor_input = executor_state.input_content
-    executor_output = executor_state.output_content
+    information = {
+        "session_address": now_state.session_address,
+        "chat_id": now_state.chat_id,
+        "task_id": now_state.now_task_id,
+        "target": now_state.now_target,
+        "executor_target": executor_state.supervisor_guidance,
+        "executor_results": executor_state.output_content,
+        "executor_is_finished": executor_state.is_finished,
+        "executor_record_locators": [
+            {
+                "session_address": now_state.session_address,
+                "chat_id": now_state.chat_id,
+                "task_id": now_state.now_task_id,
+                "seq": seq,
+            }
+            for seq in executor_state.passed_seq_list
+        ],
+        "executor_is_error": executor_state.is_error,
+        "executor_error_message": executor_state.error_message,
+        "skills": _skill_catalog(skill_list),
+        "supervisor_history": list(supervisor_evaluation_state.memory_window)[-10:],
+    }
+    if selected_skill is not None:
+        information["selected_skill"] = {
+            "name": selected_skill.name,
+            "content": _read_skill(selected_skill),
+        }
+    return build_model_messages(supervisor, SUPERVISOR_EVALUATION_PROMPT, information)
 
-    executor_last_seqs = executor_state.passed_seq_list
-    executor_is_error = executor_state.is_error
-    executor_error_message = executor_state.error_message
 
-    infos = {}
+def _build_decision_message(
+    now_state,
+    supervisor_state,
+    supervisor_evaluation_state,
+    executor_state,
+    supervisor,
+):
+    information = {
+        "session_address": now_state.session_address,
+        "chat_id": now_state.chat_id,
+        "task_list": list(now_state.task_list),
+        "now_task_id": now_state.now_task_id,
+        "now_target": now_state.now_target,
+        "executor_target": executor_state.supervisor_guidance,
+        "supervisor_evaluation_result": supervisor_evaluation_state.output_content,
+        "executor_is_passed": supervisor_evaluation_state.is_executor_passed,
+        "executor_not_pass_reason": supervisor_evaluation_state.not_pass_reason,
+        "executor_is_error": supervisor_evaluation_state.is_executor_error,
+        "executor_error_message": supervisor_evaluation_state.executor_error_message,
+        "memory_window": list(supervisor_state.memory_window)[-10:],
+    }
+    return build_model_messages(supervisor, SUPERVISOR_DECISION_PROMPT, information)
 
-    infos["target"] = now_target
-    infos["executor_target"] = executor_input
-    infos["executor_results"] = executor_output
-    infos["executor_passed_seqs"] = executor_last_seqs
-    infos["executor_is_error"] = executor_is_error
-    infos["executor_error_message"] = executor_error_message
-    infos["skills"] = skill_list
 
-    infos["supervisor_history"] = supervisor_evaluation_state.memory_window if len( supervisor_evaluation_state.memory_window) > 0 else None
-    return build_model_messages(
-        provider=supervisor,
-        prompt=SUPERVISOR_EVALUATION_PROMPT,
-        information=infos
+async def _call_supervisor_model(
+    now_state, chat_function, client, provider, messages, tools
+):
+    if now_state.model_request_count >= now_state.max_model_requests:
+        return {"status": "error", "message": "model request budget exhausted", "tool": []}
+    now_state.model_request_count += 1
+    return await call_chat_function(
+        chat_function,
+        provider,
+        client,
+        now_state.supervisor_model,
+        messages,
+        tools,
+        now_state.temperature,
     )
 
-def _update_supervisor_evaluation_state(
-        supervisor_evaluation_state:SupervisorEvaluationState,
-        supervisor_state:SupervisorState,
-        supervisor_results:SupervisorEvaluation,
-        tool_name:str,
-        tool_results:str,
-        input_content:list[dict],
-        output_content:str
+
+async def _prepare_initial_guidance(
+    now_state,
+    supervisor_state,
+    chat_function,
+    client,
+    supervisor,
 ):
-    supervisor_evaluation_state.input_content = input_content
-    supervisor_evaluation_state.is_executor_error = supervisor_results.is_error
-    supervisor_evaluation_state.executor_error_message = supervisor_results.reason
-    supervisor_evaluation_state.is_executor_passed = supervisor_results.is_passed
-    supervisor_evaluation_state.not_pass_reason = supervisor_results.reason
+    prompt = """
+规划已经完成，当前还没有任何 Executor 输出。不要进行验收。
+只分析 task_list 第 0 项，为 Executor 生成具体操作指导和可核验完成条件。
+仅返回 JSON：
+{
+  "description": "为什么这样指导",
+  "executor_guidance": "具体执行步骤",
+  "completion_criteria": "必须提供的完成证据"
+}
+"""
+    messages = build_model_messages(
+        supervisor,
+        prompt,
+        {
+            "user_query": bounded_text(now_state.user_query, USER_QUERY_MAX_CHARS),
+            "task_list": now_state.task_list,
+            "now_task_id": 0,
+            "now_target": now_state.now_target,
+        },
+    )
+    response = await _call_supervisor_model(
+        now_state, chat_function, client, supervisor, messages, []
+    )
+    if response["status"] != "success" or response["tool"]:
+        raise RuntimeError("Supervisor failed to produce initial executor guidance")
+    guidance = InitialGuidance.model_validate(
+        parse_json_object(response.get("message"))
+    )
+    supervisor_state.executor_plan = (
+        guidance.executor_guidance
+        + "\n完成条件："
+        + guidance.completion_criteria
+    )
+    supervisor_state.verification_requirement = guidance.completion_criteria
+    supervisor_state.description = guidance.description
+    supervisor_state.output_content = guidance.description
+    _save_supervisor_turn(
+        now_state, supervisor_state, "initial_guidance", guidance.description
+    )
+
+
+def _apply_plan(now_state, supervisor_state, result):
+    now_state.task_list = list(result.task_list)
+    now_state.now_task_id = 0
+    now_state.now_target = now_state.task_list[0]
+    supervisor_state.task_id = 0
+    supervisor_state.target = now_state.now_target
+    supervisor_state.description = result.description
+    supervisor_state.output_content = result.description
+    supervisor_state.executor_plan = (
+        result.executor_guidance
+        or f"执行当前任务并提供可核验结果：{now_state.now_target}"
+    )
+
+
+def _apply_evaluation(evaluation_state, supervisor_state, result):
+    evaluation_state.is_executor_passed = result.is_passed
+    evaluation_state.is_executor_error = result.is_error
+    evaluation_state.executor_error_message = result.reason
+    evaluation_state.not_pass_reason = result.reason
+    evaluation_state.description = result.description
+    evaluation_state.output_content = result.description
+    evaluation_state.is_finished = result.is_finished
+    _evaluation_memory(evaluation_state, result.description)
+    supervisor_state.is_executor_passed = result.is_passed
+    supervisor_state.is_executor_error = result.is_error
+    supervisor_state.executor_error_message = result.reason
+    supervisor_state.description = result.description
+    supervisor_state.output_content = result.description
+
+
+def _apply_decision(supervisor_state, result):
+    supervisor_state.executor_plan = result.next_executor_target
+    supervisor_state.need_date_back = result.need_date_back
+    supervisor_state.date_back_locations = [
+        item.model_dump() for item in result.date_back_location
+    ]
+    supervisor_state.date_back_input = result.date_back_input
+    supervisor_state.modify_content = result.modify_content
+    supervisor_state.verification_requirement = result.verification_requirement
+    supervisor_state.description = result.description
+    supervisor_state.output_content = result.description
+    supervisor_state.is_next_target = result.is_next_target
+    supervisor_state.proposed_task_list = (
+        list(result.new_task_list) if result.is_task_list_need_change else None
+    )
+    supervisor_state.decision_finished = result.is_finished
+    supervisor_state.final_answer = result.final_answer
+
+
+def _reset_supervisor_turn(now_state, supervisor_state, evaluation_state):
+    supervisor_state.task_id = now_state.now_task_id
+    supervisor_state.target = now_state.now_target
+    supervisor_state.memory_window = []
+    supervisor_state.tool_name = ""
+    supervisor_state.tool_arguments = {}
+    supervisor_state.tool_result = None
+    supervisor_state.tool_ok = None
+    supervisor_state.is_next_target = False
+    supervisor_state.proposed_task_list = None
+    supervisor_state.reviewed_executor_seqs = []
+    supervisor_state.decision_finished = False
+    supervisor_state.exit_reason = ""
+    evaluation_state.supervisor_seq = now_state.supervisor_seq
+    evaluation_state.chat_id = now_state.chat_id
+    evaluation_state.task_id = now_state.now_task_id
+    evaluation_state.target = now_state.now_target
+    evaluation_state.input_content = ""
+    evaluation_state.memory_window = []
+    evaluation_state.output_content = ""
+    evaluation_state.description = ""
+    evaluation_state.is_executor_passed = False
+    evaluation_state.not_pass_reason = ""
+    evaluation_state.is_executor_error = False
+    evaluation_state.executor_error_message = ""
+    evaluation_state.tool_name = ""
+    evaluation_state.tool_result = None
+    evaluation_state.is_finished = False
+    evaluation_state.blocked = False
+
+
+def _next_supervisor_seq(now_state, supervisor_state):
+    now_state.supervisor_seq += 1
+    supervisor_state.supervisor_seq = now_state.supervisor_seq
+    return now_state.supervisor_seq
+
+
+def _save_supervisor_tool_event(
+    now_state, supervisor_state, tool_name, arguments, tool_result, phase
+):
+    _next_supervisor_seq(now_state, supervisor_state)
+    supervisor_state.tool_name = tool_name
+    supervisor_state.tool_arguments = arguments
+    supervisor_state.tool_result = tool_result
+    supervisor_state.tool_ok = tool_result.ok
+    supervisor_state.description = f"{phase} 调用 {tool_name}"
+    supervisor_state.input_content = arguments
+    supervisor_state.output_content = tool_result.to_dict()
+    save_supervisor_state_history(supervisor_state, record_type=f"{phase}_tool_event")
+
+
+def _save_supervisor_turn(now_state, supervisor_state, phase, description):
+    _next_supervisor_seq(now_state, supervisor_state)
+    supervisor_state.description = description or ""
+    supervisor_state.output_content = description or supervisor_state.output_content
+    save_supervisor_state_history(supervisor_state, record_type=f"{phase}_turn")
+    now_state.supervisor_descriptions.append_turn(
+        supervisor_seq=supervisor_state.supervisor_seq,
+        task_id=supervisor_state.task_id,
+        target=supervisor_state.target,
+        phase=phase,
+        description=supervisor_state.description,
+    )
+
+
+def _evaluation_memory(state, description):
+    if description:
+        state.memory_window.append(
+            bounded_text(description, DESCRIPTION_MAX_CHARS, keep_tail=True)
+        )
+        del state.memory_window[:-10]
+
+
+def _validate_decision_plan(now_state, result):
+    if not result.is_task_list_need_change:
+        return
+    cleaned = [
+        item.strip()
+        for item in result.new_task_list
+        if isinstance(item, str) and item.strip()
+    ]
+    completed_prefix = now_state.task_list[: now_state.now_task_id]
+    if len(cleaned) <= now_state.now_task_id:
+        raise ValueError("new_task_list removed the current task position")
+    if cleaned[: now_state.now_task_id] != completed_prefix:
+        raise ValueError("new_task_list cannot rewrite completed tasks")
+    result.new_task_list = cleaned
+
+
+def _load_planning_skill():
+    try:
+        return PLAN_SKILL_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FileNotFoundError(f"planning skill not available: {PLAN_SKILL_PATH}") from exc
+
+
+def _load_planning_prompt():
+    return _load_planning_skill()
+
+
+def _tool_catalog(tools):
+    catalog = []
+    for tool in tools:
+        function = tool.get("function", tool)
+        catalog.append(
+            {
+                "name": function.get("name"),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters")
+                or function.get("input_schema")
+                or {},
+            }
+        )
+    return catalog
+
+
+def _skill_catalog(skills):
+    return [
+        {"id": item.id, "name": item.name, "description": item.description}
+        for item in skills
+    ]
+
+
+def _load_supervisor_skill(skills, selection):
+    if selection is None or selection.skill_id is None or not selection.skill_name:
+        return None
+    selected = next((item for item in skills if item.id == selection.skill_id), None)
+    if selected is None or selected.name != selection.skill_name:
+        return None
+    if not Path(selected.address).is_file():
+        return None
+    return selected
+
+
+def _read_skill(skill):
+    try:
+        return bounded_text(
+            Path(skill.address).read_text(encoding="utf-8"),
+            DESCRIPTION_MAX_CHARS,
+            keep_tail=True,
+        )
+    except OSError:
+        return ""
+
+
+def _update_supervisor_evaluation_state(
+    supervisor_evaluation_state,
+    supervisor_state,
+    supervisor_results,
+    tool_name="",
+    tool_results=None,
+    input_content=None,
+    output_content="",
+):
+    """Compatibility helper for older callers."""
+    _apply_evaluation(supervisor_evaluation_state, supervisor_state, supervisor_results)
     supervisor_evaluation_state.tool_name = tool_name
     supervisor_evaluation_state.tool_result = tool_results
-    supervisor_evaluation_state.output_content = output_content
+    supervisor_evaluation_state.input_content = input_content or []
+    if output_content:
+        supervisor_evaluation_state.output_content = output_content
 
 
-    supervisor_state.supervisor_seq = supervisor_evaluation_state.supervisor_seq
-    supervisor_state.memory_window = supervisor_evaluation_state.memory_window
-    supervisor_state.is_executor_error = supervisor_evaluation_state.is_executor_error
-    supervisor_state.executor_error_message = supervisor_evaluation_state.executor_error_message
-    supervisor_state.input_content = supervisor_evaluation_state.input_content
-    supervisor_state.output_content = supervisor_evaluation_state.output_content
-
-
-def _update_Agent_state(
-        now_state:AgentState,
-        SupervisorState:SupervisorState,
-        message:list[dict]
-):
+def _update_Agent_state(now_state, supervisor_state, message):
     now_state.supervisor_input = message
-    now_state.supervisor_output = SupervisorState.output_content
-    now_state.supervisor_seq = now_state.supervisor_seq
+    now_state.supervisor_output = supervisor_state.output_content
+    now_state.supervisor_seq = supervisor_state.supervisor_seq

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -33,16 +34,31 @@ class ToolExecutionResult:
 
     def to_model_content(self):
         return json.dumps(
-            self.to_dict(),
+            _json_safe(self.to_dict()),
             ensure_ascii=False,
-            default=str
         )
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "model_dump"):
+        return _json_safe(value.model_dump(mode="json", exclude_none=True))
+    if hasattr(value, "dict"):
+        return _json_safe(value.dict(exclude_none=True))
+    raise TypeError(f"unsupported tool result value: {type(value).__name__}")
 
 
 SUPERVISOR_ONLY_TOOLS = {
     "read_now_task",
     "read_history_task",
-    "read_history_chat_resource",
+    "read_history_chat",
     "read_task_history_error",
     "read_task_error",
     "read_supervisor_task",

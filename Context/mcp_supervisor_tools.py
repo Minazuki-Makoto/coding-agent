@@ -49,10 +49,13 @@ def read_supervisor_task_history(
                 ),
                 "target": history.get("target"),
                 "tool_name": history.get("tool_name"),
+                "arguments": history.get("arguments", {}),
                 "input_content": history.get("input_content"),
                 "output_content": history.get("output_content"),
                 "exists_error": bool(history.get("exists_error", False)),
                 "error_message": history.get("error_message", ""),
+                "is_executor_passed": history.get("is_executor_passed"),
+                "reviewed_executor_seqs": history.get("reviewed_executor_seqs", []),
                 "locator": {
                     "session_address": session_directory,
                     "chat_id": chat_id,

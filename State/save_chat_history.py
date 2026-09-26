@@ -9,6 +9,7 @@ def save_chat_history(
         description:str,
         task_number:int,
         seq_number:int,
+        supervisor_descriptions:list[dict] | None = None,
 ):
     session_address = Path(session_address)
     session_address.mkdir(parents=True,exist_ok=True)
@@ -23,7 +24,8 @@ def save_chat_history(
                     "session_address":str(session_address),
                     "query_content":query_content,
                     "answer_content":answer_content,
-                    "description":description
+                    "description":description,
+                    "supervisor_descriptions":supervisor_descriptions or [],
                 },ensure_ascii=False,
             )+'\n'
         )

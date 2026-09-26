@@ -1,321 +1,416 @@
 from __future__ import annotations
-from pathlib import Path
 
-import json
+from pathlib import Path
 from typing import TYPE_CHECKING
-from  pydantic import BaseModel
+
+from pydantic import BaseModel
 
 from AgentLoop.loop_utils import (
+    DESCRIPTION_MAX_CHARS,
+    USER_QUERY_MAX_CHARS,
+    bounded_text,
     build_model_messages,
+    build_tool_observation_messages,
     call_chat_function,
     normalize_tool_calls,
-    parse_json_object
+    parse_json_object,
 )
-
-from agent import Skill,AgentState,SupervisorState,ExecutorState
-from MCP_functions.tool_registry import AgentRole,ToolRegistry
+from MCP_functions.tool_registry import AgentRole, ToolRegistry
+from State.save_executor_state_history import save_state_history
 
 if TYPE_CHECKING:
-    from AgentLoop.agent import AgentState
+    from AgentLoop.agent import AgentState, ExecutorState, Skill, SupervisorState
 
 
-executor_prompt = """
-你是 coding agent 的 executor，只负责完整执行当前 target，不重新规划整个任务。
+EXECUTOR_PROMPT = """
+你是 coding agent 的 Executor。只执行当前 target 和 Supervisor 本轮指导，不修改总计划或 task_id。
 
-每次模型请求都会提供 previous_description。第一轮可能为空；之后它是上一轮模型或 supervisor 留下的描述。跨轮判断只能依赖这个描述和当前输入，不能假设仍然拥有更早的对话上下文。
-
-执行规则：
-1. 每个内部步骤最多调用一个本轮 tools 中真实存在的工具，严格遵守名称、description 和参数 schema。
-2.have_been_solved字段给你提供了你已经执行完的步骤，根据已经执行过的，严格按照supervisor_distributed_target字段的内容为你将要达到的目标，
-target为总目标，进行下一个步骤的选择。selected_skill字段如果为空，代表当前状态下没有选择好skill，你可以结合情况判断选择哪个skill，不为空的话严格结合当前实际情况
-判断skill有没有执行完，需不需要换skill等等。
-2.如果传入字段中“have_answered_times”为0，需要你选择在传递给你的skill_List里面选择一个skill，然后按照这个skill的流程来回答问题，当然你也可以不选，返回skill的name和编号
-3.输出五个字段，tool_name表示当前选择的tool工具名称，selected_skill代表你要选择的skill，也就是你工作的指导书，selected_skill
-字段里还包括skill_name和传递给你的skill的id。description是结合给你的tool_result字段你给我提供的这个操作的总结。当然如果没有这个字段就返回空。
-is_finished是需要根据你得到的tool_result和description，判断传入的supervisor_distributed_target字段的任务有没有被完成，
-完成了返回true，没完成返回false
-输出结果类型:
+规则：
+1. 每一步最多调用一个已提供工具；不得调用不存在的工具或伪造结果。
+2. 工具调用消息可以没有文本。收到真实 tool_result 后，才总结该操作。
+3. is_finished 只表示本轮委派目标已完成，之后仍必须由 Supervisor 验收。
+4. 信息或证据不足时返回 false，并说明下一步；不要把“没有报错”当作完成证据。
+5. selected_skill 可为空。若选择，必须使用 skills 中真实的 id/name；skill 不授予额外工具权限。
+6. 最终仅返回 JSON：
 {
-    "tool_name":"",
-    "selected_skill":{
-        "skill_name":"",
-        "skill_id":""
-    },
-    "description":"",
-    "is_finished":true
+  "tool_name": null,
+  "selected_skill": {"skill_name": null, "skill_id": null},
+  "description": "本步事实、产出、证据和未完成项",
+  "is_finished": false
 }
-
-不得调用未提供的工具，不得伪造工具结果，不得自行宣布未验证的操作成功。
 """
+
+
 class SelectedSkill(BaseModel):
-    skill_name:str | None =None
-    skill_id:int | None = None
+    skill_name: str | None = None
+    skill_id: int | None = None
+
 
 class ExecutorOutPut(BaseModel):
-    tool_name:str | None = None
-    selected_skill:SelectedSkill | None = None
-    description:str | None = None
-    is_finished:bool | None = False
+    tool_name: str | None = None
+    selected_skill: SelectedSkill | None = None
+    description: str = ""
+    is_finished: bool = False
 
 
 async def run_executor_loop(
-        now_state:AgentState,
-        executor:str,
-        executor_client,
-        chat_function,
-        executor_tools:list[dict],
-        tool_registry:ToolRegistry,
-        skill_lists:list[Skill],
-        supervisor_state:SupervisorState,
-        executor_state:ExecutorState
+    now_state: AgentState,
+    executor: str,
+    executor_client,
+    chat_function,
+    executor_tools: list[dict],
+    tool_registry: ToolRegistry,
+    skill_lists: list[Skill],
+    supervisor_state: SupervisorState,
+    executor_state: ExecutorState,
 ):
-    executing_times = 0
+    _reset_executor_turn(now_state, supervisor_state, executor_state)
+    selected_skill = None
+    descriptions: list[str] = []
+    steps = 0
+    exit_reason = "executor_step_limit"
 
-    output_content = ""
-    skill = None
-
-    #清空上轮记忆窗
-    executor_state.memory_window = []
-    while(executing_times < now_state.max_executor_steps):
-
-        message = _build_executor_messages(
-            time = executing_times,
-            supervisor_state=supervisor_state,
-            now_state=now_state,
-            executor_state=executor_state,
-            executor=executor,
-            skill = skill
+    if skill_lists:
+        selected_skill, selection_description = await _select_skill_before_action(
+            now_state,
+            executor,
+            executor_client,
+            chat_function,
+            skill_lists,
         )
+        executor_state.selected_skill = selected_skill
+        if selection_description:
+            descriptions.append(selection_description)
+            _remember(executor_state, selection_description)
 
+    while steps < now_state.max_executor_steps:
+        steps += 1
+        now_state.executor_executing_times += 1
         try:
-            response =  call_chat_function(
-                chat_function=chat_function,
-                client=executor_client,
-                model=now_state.executor_model,
-                provider=executor,
-                messages=message,
-                tools=executor_tools,
-                temperature=now_state.temperature
+            response = await _call_model(
+                now_state,
+                chat_function,
+                executor_client,
+                executor,
+                _build_executor_messages(
+                    steps - 1,
+                    supervisor_state,
+                    now_state,
+                    executor_state,
+                    executor,
+                    skill_lists,
+                    selected_skill,
+                ),
+                executor_tools,
             )
+            if response["status"] != "success":
+                raise RuntimeError(response.get("message") or "executor model request failed")
 
-            if response.get("status") == "error":
-                raise ValueError("there may be some problems when model dealing with tasks")
+            tool_calls = normalize_tool_calls(executor, response["tool"])
+            if len(tool_calls) > 1:
+                description = "模型一次返回了多个工具调用；本步未执行任何工具，请一次只选择一个。"
+                descriptions.append(description)
+                _remember(executor_state, description)
+                executor_state.is_error = True
+                executor_state.error_message = description
+                continue
 
-            tools = response.get("tools",{})
-
-            #没工具直接结束
-            if not tools or tools == {}:
-
-                executor_input = (
-                        f"supervisor安排的任务:{executor_state.supervisor_guidance}" +
-                        f"\n\n当前目标task:{executor_state.now_target}"
+            if not tool_calls:
+                output = ExecutorOutPut.model_validate(
+                    parse_json_object(response.get("message"))
                 )
-                _update_now_state(now_state, executor_state, executor_input, output_content)
+                loaded_skill = _load_selected_skill(skill_lists, output.selected_skill)
+                if selected_skill is None and loaded_skill is not None and not output.is_finished:
+                    selected_skill = loaded_skill
+                    executor_state.selected_skill = loaded_skill
+                    description = output.description or f"已选择 skill：{loaded_skill.name}"
+                    descriptions.append(description)
+                    _remember(executor_state, description)
+                    continue
 
-                return
-
-            tool_calls = normalize_tool_calls(
-                provider=executor,
-                tool_calls = tools
-            )
+                description = bounded_text(
+                    output.description, DESCRIPTION_MAX_CHARS, keep_tail=True
+                )
+                if description:
+                    descriptions.append(description)
+                    _remember(executor_state, description)
+                executor_state.description = description
+                executor_state.is_finished = output.is_finished
+                if output.is_finished:
+                    exit_reason = "executor_reported_finished"
+                    break
+                continue
 
             tool_call = tool_calls[0]
-
-            tool_result = tool_registry.call(
+            tool_result = await tool_registry.call(
                 role=AgentRole.EXECUTOR,
                 tool_name=tool_call.name,
-                arguments=tool_call.arguments
+                arguments=tool_call.arguments,
             )
-
-            message.append(
-                {
-                    "role":"user",
-                    "content":f"tool_result:{tool_result}"
-                }
-            )
-            first_information = parse_json_object(response.get(message))
-            executor_output = ExecutorOutPut.model_validate(first_information)
-
-            selected_skill = executor_output.selected_skill.skill_name
-            selected_skill_id = executor_output.selected_skill.skill_id
-
-            #加载skill
-            _load_skill_content(
-                skill_list=skill_lists,
-                skill_name=selected_skill,
-                skill_id=selected_skill_id,
-                message=message,
-                executor=executor
-            )
-
-            #第二次不传工具
-            response = await call_chat_function(
-                chat_function=chat_function,
-                client=executor_client,
-                model=now_state.executor_model,
-                provider=executor,
-                messages=message,
-                tools=[],
-                temperature=now_state.temperature
-            )
-
-            information = parse_json_object(response.get("message"))
-
-            if response.get("status") == "success":
-                output_content += (
-                        f"\n\n第{executing_times + 1}次执行任务，完成了" +
-                        f"{information.get("description")}"
-                )
-
-            else:
-                output_content += (
-                    f"\n\n第{executing_times+1}次执行任务失败了，失败原因:"
-                    f"{information.get("message")}"
-                )
-
-            executor_state.memory_window.append(f"第{executing_times + 1}轮已完成:{information.get("description")}")
-
-            executing_times +=1
-            executor_state.executor_seq += 1
+            now_state.executor_seq += 1
+            executor_state.executor_seq = now_state.executor_seq
             executor_state.passed_seq_list.append(executor_state.executor_seq)
+            executor_state.tool_name = tool_call.name
+            executor_state.tool_arguments = tool_call.arguments
+            executor_state.tool_result = tool_result
+            executor_state.tool_ok = tool_result.ok
+            executor_state.description = "工具已执行，等待观察总结。"
+            executor_state.is_error = not tool_result.ok
+            executor_state.error_message = (
+                "" if tool_result.ok else (tool_result.message or tool_result.error_type or "")
+            )
+            save_state_history(executor_state, record_type="tool_event")
 
-            _update_executor_state(
+            messages = _build_executor_messages(
+                steps - 1,
+                supervisor_state,
+                now_state,
                 executor_state,
-                is_finished=information.get("is_finished").lower() == "true",
-                output_content=output_content,
-                is_error=response.get("status") == "error",
-                error_message=response.get("message") if "message" in response else None,
-                input_content=json.dumps(information)
+                executor,
+                skill_lists,
+                selected_skill,
             )
-
-            if (
-                    information.get("is_finished").lower() == "true" or
-                    response.get("state")=="error" or
-                    executing_times ==  now_state.max_executor_steps - 1
-            ):
-                executor_input = (
-                    f"supervisor安排的任务:{executor_state.supervisor_guidance}"+
-                    f"\n\n当前目标task:{executor_state.now_target}"
+            messages.extend(
+                build_tool_observation_messages(
+                    executor, response.get("message"), tool_call, tool_result
                 )
-                _update_now_state(now_state,executor_state,executor_input,output_content)
-
-                return
-
-        except Exception as e:
-            executor_input = (
-                    f"supervisor安排的任务:{executor_state.supervisor_guidance}" +
-                    f"\n\n当前目标task:{executor_state.now_target}"
             )
+            summary = await _summarize_tool_once(
+                now_state,
+                chat_function,
+                executor_client,
+                executor,
+                messages,
+            )
+            description = bounded_text(
+                summary.description, DESCRIPTION_MAX_CHARS, keep_tail=True
+            )
+            descriptions.append(description)
+            _remember(executor_state, description)
+            executor_state.description = description
+            executor_state.is_finished = summary.is_finished
+            executor_state.is_error = not tool_result.ok
+            if summary.is_finished:
+                exit_reason = "executor_reported_finished"
+                break
 
-            _update_now_state(now_state, executor_state, executor_input, output_content)
+        except Exception as exc:
+            executor_state.is_error = True
+            executor_state.error_message = str(exc)
+            description = f"Executor 本轮异常：{exc}"
+            executor_state.description = description
+            descriptions.append(description)
+            _remember(executor_state, description)
+            exit_reason = "executor_exception"
+            break
 
+    executor_state.output_content = bounded_text(
+        "\n".join(item for item in descriptions if item),
+        DESCRIPTION_MAX_CHARS,
+        keep_tail=True,
+    )
+    executor_state.exit_reason = exit_reason
+    executor_state.input_content = {
+        "target": executor_state.now_target,
+        "supervisor_guidance": executor_state.supervisor_guidance,
+    }
+    now_state.executor_seq += 1
+    executor_state.executor_seq = now_state.executor_seq
+    executor_state.passed_seq_list.append(executor_state.executor_seq)
+    save_state_history(executor_state, record_type="executor_turn")
+    _update_now_state(now_state, executor_state)
+    return executor_state
+
+
+async def _summarize_tool_once(
+    now_state,
+    chat_function,
+    executor_client,
+    executor,
+    messages,
+):
+    last_error = None
+    for _ in range(2):
+        try:
+            response = await _call_model(
+                now_state,
+                chat_function,
+                executor_client,
+                executor,
+                messages,
+                [],
+            )
+            if response["status"] != "success":
+                raise RuntimeError(response.get("message") or "tool summary request failed")
+            return ExecutorOutPut.model_validate(
+                parse_json_object(response.get("message"))
+            )
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"工具已执行，但观察总结失败：{last_error}")
+
+
+async def _select_skill_before_action(
+    now_state,
+    executor,
+    executor_client,
+    chat_function,
+    skill_lists,
+):
+    prompt = """
+这是 Executor 的无工具 skill 选择阶段，尚未执行任何操作。
+根据当前目标从 skills 中选择一个指导后续操作，或明确不选择。
+不得声称任务已经完成。仅返回 Executor JSON 格式。
+"""
+    messages = build_model_messages(
+        executor,
+        prompt,
+        {
+            "user_query": bounded_text(now_state.user_query, USER_QUERY_MAX_CHARS),
+            "target": now_state.now_target,
+            "skills": [
+                {"id": item.id, "name": item.name, "description": item.description}
+                for item in skill_lists
+            ],
+        },
+    )
+    response = await _call_model(
+        now_state,
+        chat_function,
+        executor_client,
+        executor,
+        messages,
+        [],
+    )
+    if response["status"] != "success" or response["tool"]:
+        return None, "skill 选择阶段未形成有效选择，继续使用基础流程。"
+    try:
+        output = ExecutorOutPut.model_validate(
+            parse_json_object(response.get("message"))
+        )
+    except Exception:
+        return None, "skill 选择输出无效，继续使用基础流程。"
+    return (
+        _load_selected_skill(skill_lists, output.selected_skill),
+        output.description,
+    )
+
+
+async def _call_model(now_state, chat_function, client, provider, messages, tools):
+    if now_state.model_request_count >= now_state.max_model_requests:
+        raise RuntimeError("model request budget exhausted")
+    now_state.model_request_count += 1
+    return await call_chat_function(
+        chat_function=chat_function,
+        provider=provider,
+        client=client,
+        model=now_state.executor_model,
+        messages=messages,
+        tools=tools,
+        temperature=now_state.temperature,
+    )
 
 
 def _build_executor_messages(
-        time:int,
-        supervisor_state:SupervisorState,
-        now_state:AgentState,
-        executor_state:ExecutorState,
-        executor:str,
-        skill:Skill=None
+    time: int,
+    supervisor_state: SupervisorState,
+    now_state: AgentState,
+    executor_state: ExecutorState,
+    executor: str,
+    skill_lists: list[Skill],
+    skill: Skill | None = None,
 ):
-    now_target = now_state.now_target
-    supervisor_distributed_target = supervisor_state.executor_plan
-
-    queries = {
-        "have_answered_times":time,
-        "target":now_target,
-        "supervisor_distributed_target":supervisor_distributed_target,
+    information = {
+        "have_answered_times": time,
+        "user_query": bounded_text(now_state.user_query, USER_QUERY_MAX_CHARS),
+        "target": now_state.now_target,
+        "supervisor_distributed_target": supervisor_state.executor_plan,
+        "environment": {"java": now_state.java, "python": now_state.python},
+        "skills": [
+            {"id": item.id, "name": item.name, "description": item.description}
+            for item in skill_lists
+        ],
+        "recent_descriptions": list(executor_state.memory_window)[-10:],
+        "latest_tool_observation": (
+            executor_state.tool_result.to_dict()
+            if hasattr(executor_state.tool_result, "to_dict")
+            else executor_state.tool_result
+        ),
     }
-
-
-    if supervisor_state.need_date_back and supervisor_state.date_back_input:
-        queries["date_back"] = (
-                "你应该回答这个问题:" +
-                f"\n{supervisor_state.date_back_input}"+
-                f"\n\n修改意见:"+
-                f"\n{supervisor_state.date_back_input}"
-        )
-
+    if supervisor_state.need_date_back:
+        information["date_back"] = {
+            "original_target": now_state.now_target,
+            "problem": supervisor_state.date_back_input,
+            "modification": supervisor_state.modify_content,
+            "verification_requirement": supervisor_state.verification_requirement,
+        }
     if skill is not None:
-        queries["selected_skill"] = (
-            f"已选择的skill:{skill.name}"+
-            f"\n\n描述:{skill.description}"
-        )
-
-    if len(executor_state.memory_window) != 0 and time > 0:
-        queries["have_been_solved"] = executor_state.memory_window
-
-    message = build_model_messages(
-        executor,
-        prompt=executor_prompt,
-        information=queries
-    )
-
-    return message
+        information["selected_skill"] = {
+            "name": skill.name,
+            "description": skill.description,
+            "content": _read_skill(skill),
+        }
+    return build_model_messages(executor, EXECUTOR_PROMPT, information)
 
 
-def _update_executor_state(
-
-        executor_state:ExecutorState,
-        is_finished:bool,
-        output_content,
-        is_error:bool,
-        error_message:str,
-        input_content:str,
-
-):
-
-    executor_state.is_finished = is_finished
-    executor_state.is_error = is_error
-    executor_state.error_message = error_message
+def _reset_executor_turn(now_state, supervisor_state, executor_state):
+    executor_state.task_id = now_state.now_task_id
+    executor_state.now_target = now_state.now_target
+    executor_state.supervisor_guidance = supervisor_state.executor_plan
+    executor_state.passed_seq_list = []
+    executor_state.input_content = ""
+    executor_state.output_content = ""
+    executor_state.tool_name = ""
+    executor_state.tool_arguments = {}
+    executor_state.tool_result = None
+    executor_state.tool_ok = None
+    executor_state.description = ""
     executor_state.is_finished = False
-    executor_state.output_content = output_content
-    executor_state.input_content = input_content
+    executor_state.is_error = False
+    executor_state.error_message = ""
+    executor_state.memory_window = []
+    executor_state.selected_skill = None
+    executor_state.exit_reason = ""
 
-def _update_now_state(
-        now_state:AgentState,
-        executor_state:ExecutorState,
-        executor_input_content:str,
-        executor_output:str
-):
-    now_state.executor_seq = executor_state.executor_seq
-    now_state.executor_input = executor_input_content
-    now_state.executor_output = executor_output
 
-def _load_skill_content(
-        skill_list:list[Skill],
-        skill_name:str,
-        skill_id:int,
-        message:list[dict],
-        executor:str
-):
-    if skill_list[skill_id] != skill_name:
-        return
-
-    selected_skill = skill_list[skill_id]
-    address = selected_skill.address
-
-    address = Path(address)
-    if not address.exists():
-        return
-
-    with open(address,"r",encoding="utf-8") as f:
-        skill_content = f.read()
-
-    if executor == "claude":
-        message.append(
-            {
-                "role":"user",
-                "content":f"skill:{skill_content}"
-            }
+def _remember(executor_state, description: str):
+    if description:
+        executor_state.memory_window.append(
+            bounded_text(description, DESCRIPTION_MAX_CHARS, keep_tail=True)
         )
+        del executor_state.memory_window[:-10]
 
-    else:
-        message.append(
-            {
-                "role":"system",
-                "content":f"skill:{skill_content}"
-            }
+
+def _update_now_state(now_state, executor_state):
+    now_state.executor_input = executor_state.input_content
+    now_state.executor_output = executor_state.output_content
+
+
+def _load_selected_skill(skill_list, selection: SelectedSkill | None):
+    if selection is None or selection.skill_id is None or not selection.skill_name:
+        return None
+    if selection.skill_id < 0:
+        return None
+    selected = next((item for item in skill_list if item.id == selection.skill_id), None)
+    if selected is None or selected.name != selection.skill_name:
+        return None
+    if not Path(selected.address).is_file():
+        return None
+    return selected
+
+
+def _read_skill(skill) -> str:
+    try:
+        return bounded_text(
+            Path(skill.address).read_text(encoding="utf-8"),
+            DESCRIPTION_MAX_CHARS,
+            keep_tail=True,
         )
-        return selected_skill
+    except OSError:
+        return ""
+
+
+def _load_skill_content(skill_list, skill_name, skill_id, message=None, executor=None):
+    """Compatibility wrapper retained for callers outside this module."""
+    selection = SelectedSkill(skill_name=skill_name, skill_id=skill_id)
+    return _load_selected_skill(skill_list, selection)

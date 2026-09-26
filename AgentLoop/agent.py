@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from contextlib import AsyncExitStack
-from dataclasses import dataclass,field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any,Literal
+from typing import Any
 
 from anthropic import Anthropic
+from mcp import StdioServerParameters
 from openai import OpenAI
 from zai import ZhipuAiClient
-from mcp import StdioServerParameters
 
 from AgentChat.Chatgpt_chat import chatGpt_chat
 from AgentChat.Claude_chat import claude_chat
@@ -18,34 +19,29 @@ from AgentChat.DeepSeek_chat import deepseek_chat
 from AgentChat.GLM_chat import zhipu_chat
 from AgentChat.Qwen_chat import qwen_chat
 from AgentLoop.executor_loop import run_executor_loop
-from AgentLoop.loop_utils import (
-    USER_QUERY_MAX_CHARS,
-    bounded_text,
-    build_model_messages,
-    call_chat_function,
-    normalize_tool_calls,
-    parse_json_object,
+from AgentLoop.supervisor_loop import (
+    run_supervisor_loop,
+    summarize_supervisor_descriptions,
+    supervisor_making_plan,
 )
-
 from MCP_functions.MCP_hosts import mcp_host
 from MCP_functions.Search.mcp_search_server import get_remote_mcp_link
-from MCP_functions.tool_registry import AgentRole,ToolRegistry
+from MCP_functions.tool_registry import AgentRole, ToolRegistry
 from State.save_chat_history import save_chat_history
-from State.save_executor_state_history import save_state_history
-from MCP_functions.tool_registry import AgentRole
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INFORMATION_PATH = PROJECT_ROOT / "INFORMATION.json"
-PLAN_SKILL_PATH = PROJECT_ROOT / "Skills" / "executor_plan_skill.md"
+SKILLS_PATH = PROJECT_ROOT / "Skills"
+
 
 @dataclass
 class Skill:
-    id:int
-    name:str
-    description:str
-    address:str
-    belong:AgentRole
+    id: int
+    name: str
+    description: str
+    address: str
+    belong: AgentRole
 
 
 @dataclass
@@ -62,260 +58,536 @@ class Checkpoint:
     verification_requirement: str
 
 
+@dataclass(frozen=True)
+class SupervisorDescriptionEntry:
+    supervisor_seq: int
+    task_id: int
+    target: str
+    phase: str
+    description: str
+
+    def to_dict(self):
+        return {
+            "supervisor_seq": self.supervisor_seq,
+            "task_id": self.task_id,
+            "target": self.target,
+            "phase": self.phase,
+            "description": self.description,
+        }
+
+
+@dataclass
+class SupervisorDescriptionHistory:
+    entries: list[SupervisorDescriptionEntry] = field(default_factory=list)
+
+    def append(self, entry: SupervisorDescriptionEntry):
+        if entry.description.strip():
+            self.entries.append(entry)
+
+    def append_turn(
+        self,
+        supervisor_seq: int,
+        task_id: int,
+        target: str,
+        phase: str,
+        description: str,
+    ):
+        self.append(
+            SupervisorDescriptionEntry(
+                supervisor_seq=supervisor_seq,
+                task_id=task_id,
+                target=target,
+                phase=phase,
+                description=description,
+            )
+        )
+
+    def to_dicts(self):
+        return [entry.to_dict() for entry in self.entries]
+
+    def model_context(self, max_chars: int = 30000):
+        selected = []
+        used = 0
+        for entry in reversed(self.entries):
+            item = entry.to_dict()
+            item["description"] = item["description"][:2000]
+            size = len(json.dumps(item, ensure_ascii=False))
+            if selected and used + size > max_chars:
+                break
+            selected.append(item)
+            used += size
+        selected.reverse()
+        return {
+            "entries": selected,
+            "omitted_earlier_entries": len(self.entries) - len(selected),
+        }
+
+    def fallback_summary(self):
+        if not self.entries:
+            return ""
+        return "；".join(
+            f"{entry.phase}: {entry.description}"
+            for entry in self.entries[-5:]
+        )
+
+
 @dataclass
 class SupervisorState:
+    supervisor_seq: int = 0
+    session_address: str = ""
+    chat_id: str = ""
+    task_id: int = 0
+    target: str = ""
+    input_content: Any = ""
+    output_content: Any = ""
+    description: str = ""
+    memory_window: list[str] = field(default_factory=list)
+    executor_plan: str = ""
+    is_executor_passed: bool | None = None
+    is_executor_error: bool = False
+    executor_error_message: str = ""
+    reviewed_executor_seqs: list[int] = field(default_factory=list)
+    tool_name: str = ""
+    tool_arguments: dict[str, Any] = field(default_factory=dict)
+    tool_result: Any = None
+    tool_ok: bool | None = None
+    need_date_back: bool = False
+    date_back_locations: list[dict[str, Any]] = field(default_factory=list)
+    date_back_input: str = ""
+    modify_content: str = ""
+    verification_requirement: str = ""
+    is_next_target: bool = False
+    proposed_task_list: list[str] | None = None
+    decision_finished: bool = False
+    final_answer: str = ""
+    exit_reason: str = ""
 
-    supervisor_seq:int
-    session_address:str
 
-    chat_id:str
-    task_id:int
-    target:str
-    input_content:str
-    output_content:str
-
-    memory_window:list[str]
-    executor_plan:str
-
-    is_executor_error:bool
-    executor_error_message:str
-
-    tool_name:str
-    tool_result:str
-    need_date_back:bool
-    date_back_input:str
-    modify_content:str
-
+@dataclass
 class SupervisorEvaluationState:
-    supervisor_seq:int
-    chat_id:str
-    task_id:int
-    target:str
+    supervisor_seq: int = 0
+    chat_id: str = ""
+    task_id: int = 0
+    target: str = ""
+    input_content: Any = ""
+    memory_window: list[str] = field(default_factory=list)
+    output_content: str = ""
+    description: str = ""
+    is_executor_passed: bool = False
+    not_pass_reason: str = ""
+    is_executor_error: bool = False
+    executor_error_message: str = ""
+    tool_name: str = ""
+    tool_result: Any = None
+    is_finished: bool = False
+    blocked: bool = False
 
-    input_content:str
-    memory_window:list[str]
-    output_content:str
-    is_executor_passed:bool
-    not_pass_reason:str
-    is_executor_error:bool
-    executor_error_message:str
-
-    tool_name:str
-    tool_result:str
 
 @dataclass
 class ExecutorState:
-
-    executor_seq:int
-    chat_id:str
-    task_id:int
-    session_address:str
-    passed_seq_list:list[int]
-
-    now_target:str
-    supervisor_guidance:str
-    input_content:str
-    tool_name: str
-    output_content:str
-    tool_result:str
-
-    is_finished:bool
-    is_error:bool
-    error_message:str
-
-    memory_window:list[str]
+    executor_seq: int = 0
+    chat_id: str = ""
+    task_id: int = 0
+    session_address: str = ""
+    passed_seq_list: list[int] = field(default_factory=list)
+    now_target: str = ""
+    supervisor_guidance: str = ""
+    input_content: Any = ""
+    tool_name: str = ""
+    tool_arguments: dict[str, Any] = field(default_factory=dict)
+    output_content: str = ""
+    description: str = ""
+    tool_result: Any = None
+    tool_ok: bool | None = None
+    is_finished: bool = False
+    is_error: bool = False
+    error_message: str = ""
+    memory_window: list[str] = field(default_factory=list)
+    selected_skill: Skill | None = None
+    exit_reason: str = ""
 
 
 @dataclass
 class AgentState:
     session_address: str
     chat_id: str
-    user_query: str
-    task_list: list[str]
-    now_task_id: int
-    now_target: str
+    user_query: str = ""
+    task_list: list[str] = field(default_factory=list)
+    now_task_id: int = 0
+    now_target: str = ""
+    executor_seq: int = 0
+    supervisor_seq: int = 0
+    task_attempt: int = 0
+    executor_model: str = ""
+    supervisor_model: str = ""
+    temperature: float = 0.3
+    max_executor_steps: int = 8
+    max_supervision_times: int = 6
+    max_task_attempts: int = 3
+    max_model_requests: int = 80
+    model_request_count: int = 0
+    java: dict[str, Any] | None = None
+    python: dict[str, Any] | None = None
+    supervisor_input: Any = ""
+    supervisor_output: Any = ""
+    supervisor_executing_times: int = 0
+    executor_input: Any = ""
+    executor_output: Any = ""
+    executor_executing_times: int = 0
+    supervisor_descriptions: SupervisorDescriptionHistory = field(
+        default_factory=SupervisorDescriptionHistory
+    )
 
-    executor_seq: int
-    supervisor_seq: int
-    task_attempt: int
-    executor_model: str
-    supervisor_model: str
-    temperature: float
-    max_executor_steps: int
-    max_supervision_times: int
-    max_task_attempts: int
-    java: dict[str,Any] | None
-    python: dict[str,Any] | None
 
-    supervisor_input: str
-    supervisor_output: str
-    supervisor_executing_times: int
-
-    executor_input: str
-    executor_output: str
-    executor_executing_times: int
-
-# 兼容仍从 agent.py 导入 state 的旧模块。
 state = AgentState
 
 
-with INFORMATION_PATH.open("r",encoding="utf-8") as f:
-    infos = json.loads(f.read())
-
-supervisor = (
-    infos.get("supervisor")
-    if (infos.get(infos.get("supervisor")) or {}).get("mode") == "on"
-    else None
-)
-executor = (
-    infos.get("executor")
-    if (infos.get(infos.get("executor")) or {}).get("mode") == "on"
-    else None
-)
-temperature = infos.get("temperature",0.3)
-
-if executor is None:
-    executor = supervisor
-if supervisor is None:
-    supervisor = executor
-if executor is None or supervisor is None:
-    raise ValueError("please set at least one model")
-
-executor_api = (infos.get(executor) or {}).get("api") or None
-executor_model = (infos.get(executor) or {}).get("model") or None
-supervisor_api = (infos.get(supervisor) or {}).get("api") or None
-supervisor_model = (infos.get(supervisor) or {}).get("model") or None
-
-if executor_model is None:
-    raise ValueError("please select the executor model name")
-if supervisor_model is None:
-    raise ValueError("please select the supervisor model name")
+@dataclass(frozen=True)
+class RuntimeConfig:
+    supervisor: str
+    executor: str
+    supervisor_api: str | None
+    executor_api: str | None
+    supervisor_model: str
+    executor_model: str
+    temperature: float
+    java: dict[str, Any] | None
+    python: dict[str, Any] | None
 
 
-def state_init(session_address:str,chat_id:str):
-    return AgentState(
-        session_address=str(session_address),
-        chat_id=str(chat_id),
-        executor_model=executor_model,
+def load_runtime_config(path: Path = INFORMATION_PATH) -> RuntimeConfig:
+    with path.open("r", encoding="utf-8") as config_file:
+        infos = json.load(config_file)
+    supervisor = infos.get("supervisor")
+    executor = infos.get("executor")
+    if supervisor and (infos.get(supervisor) or {}).get("mode") != "on":
+        supervisor = None
+    if executor and (infos.get(executor) or {}).get("mode") != "on":
+        executor = None
+    executor = executor or supervisor
+    supervisor = supervisor or executor
+    if not executor or not supervisor:
+        raise ValueError("please enable at least one model provider")
+    executor_model = (infos.get(executor) or {}).get("model")
+    supervisor_model = (infos.get(supervisor) or {}).get("model")
+    if not executor_model or not supervisor_model:
+        raise ValueError("please select both executor and supervisor model names")
+    return RuntimeConfig(
+        supervisor=supervisor,
+        executor=executor,
+        supervisor_api=(infos.get(supervisor) or {}).get("api") or None,
+        executor_api=(infos.get(executor) or {}).get("api") or None,
         supervisor_model=supervisor_model,
-        temperature=float(temperature),
+        executor_model=executor_model,
+        temperature=float(infos.get("temperature", 0.3)),
         java=infos.get("java"),
         python=infos.get("python"),
     )
 
 
-async def main(query:str,session_address:str,chat_id:str):
+def state_init(session_address, chat_id, query="", config=None):
+    config = config or load_runtime_config()
+    return AgentState(
+        session_address=str(session_address),
+        chat_id=str(chat_id),
+        user_query=query,
+        executor_model=config.executor_model,
+        supervisor_model=config.supervisor_model,
+        temperature=config.temperature,
+        java=config.java,
+        python=config.python,
+    )
 
 
+async def _run_main(query: str, session_address: str, chat_id: str):
+    config = load_runtime_config()
+    now_state = state_init(session_address, chat_id, query, config)
+    supervisor_state = SupervisorState(
+        session_address=now_state.session_address, chat_id=now_state.chat_id
+    )
+    evaluation_state = SupervisorEvaluationState(chat_id=now_state.chat_id)
+    executor_state = ExecutorState(
+        session_address=now_state.session_address, chat_id=now_state.chat_id
+    )
+    supervisor_client = None
+    executor_client = None
+    status = "blocked"
+    answer = ""
+    block_reason = ""
+    chat_description = ""
+
+    async with AsyncExitStack() as stack:
+        host = mcp_host(stack)
+        await _register_mcp_clients(host)
+        registry = ToolRegistry(host)
+        supervisor_tools = registry.schemas_for(AgentRole.SUPERVISOR, config.supervisor)
+        executor_tools = registry.schemas_for(AgentRole.EXECUTOR, config.executor)
+        supervisor_skills = _load_skills(SKILLS_PATH, AgentRole.SUPERVISOR)
+        executor_skills = _load_skills(SKILLS_PATH, AgentRole.EXECUTOR)
+        supervisor_client = _build_model_client(config.supervisor, config.supervisor_api)
+        executor_client = _build_model_client(config.executor, config.executor_api)
+        chat_functions = _chat_map()
+
+        try:
+            await supervisor_making_plan(
+                query,
+                now_state,
+                chat_functions[config.supervisor],
+                supervisor_client,
+                registry,
+                config.supervisor,
+                supervisor_tools,
+                supervisor_state,
+                executor_tools=executor_tools,
+                skill_lists=supervisor_skills,
+            )
+
+            while now_state.now_task_id < len(now_state.task_list):
+                if now_state.task_attempt >= now_state.max_task_attempts:
+                    block_reason = (
+                        f"task {now_state.now_task_id} exceeded "
+                        f"{now_state.max_task_attempts} attempts"
+                    )
+                    break
+                now_state.task_attempt += 1
+                await run_executor_loop(
+                    now_state,
+                    config.executor,
+                    executor_client,
+                    chat_functions[config.executor],
+                    executor_tools,
+                    registry,
+                    executor_skills,
+                    supervisor_state,
+                    executor_state,
+                )
+                decision = await run_supervisor_loop(
+                    now_state,
+                    config.supervisor,
+                    supervisor_client,
+                    chat_functions[config.supervisor],
+                    supervisor_tools,
+                    registry,
+                    supervisor_skills,
+                    supervisor_state,
+                    evaluation_state,
+                    executor_state,
+                )
+                if supervisor_state.proposed_task_list is not None:
+                    now_state.task_list = list(supervisor_state.proposed_task_list)
+                if decision.is_next_target:
+                    now_state.now_task_id += 1
+                    now_state.task_attempt = 0
+                    if now_state.now_task_id >= len(now_state.task_list):
+                        status = "completed"
+                        answer = (
+                            decision.final_answer
+                            or executor_state.output_content
+                            or decision.description
+                        )
+                        break
+                    now_state.now_target = now_state.task_list[now_state.now_task_id]
+                    supervisor_state.task_id = now_state.now_task_id
+                    supervisor_state.target = now_state.now_target
+                    if not supervisor_state.executor_plan:
+                        supervisor_state.executor_plan = (
+                            f"执行当前任务并提供可核验证据：{now_state.now_target}"
+                        )
+                elif supervisor_state.exit_reason:
+                    block_reason = supervisor_state.exit_reason
+                    break
+            else:
+                status = "completed"
+                answer = supervisor_state.final_answer or executor_state.output_content
+        except Exception as exc:
+            block_reason = str(exc)
+        finally:
+            if now_state.supervisor_descriptions.entries:
+                try:
+                    chat_description = await summarize_supervisor_descriptions(
+                        now_state=now_state,
+                        supervisor_state=supervisor_state,
+                        supervisor=config.supervisor,
+                        supervisor_client=supervisor_client,
+                        chat_function=chat_functions[config.supervisor],
+                        status=status,
+                        answer=answer,
+                        block_reason=block_reason,
+                    )
+                except Exception:
+                    chat_description = (
+                        now_state.supervisor_descriptions.fallback_summary()
+                    )
+            await _close_model_client(supervisor_client)
+            if executor_client is not supervisor_client:
+                await _close_model_client(executor_client)
+
+    if status != "completed":
+        answer = (
+            "任务未完成。"
+            + (f"阻塞原因：{block_reason}。" if block_reason else "")
+            + (
+                f"未完成任务：{now_state.now_target}"
+                if now_state.now_target
+                else "未能生成有效计划。"
+            )
+        )
+
+    save_chat_history(
+        chat_id=now_state.chat_id,
+        session_address=now_state.session_address,
+        query_content=query,
+        answer_content=answer,
+        description=(
+            chat_description
+            or supervisor_state.description
+            or executor_state.description
+            or block_reason
+        ),
+        task_number=len(now_state.task_list),
+        seq_number=max(now_state.executor_seq, now_state.supervisor_seq),
+        supervisor_descriptions=now_state.supervisor_descriptions.to_dicts(),
+    )
+    return {
+        "status": status,
+        "answer": answer,
+        "completed_tasks": now_state.now_task_id,
+        "task_list": now_state.task_list,
+        "block_reason": block_reason,
+    }
 
 
+async def main(query: str, session_address: str, chat_id: str):
+    """Convert startup failures into a saved blocked result."""
+    try:
+        return await _run_main(query, session_address, chat_id)
+    except Exception as exc:
+        answer = f"任务未完成。启动或连接阶段失败：{exc}"
+        save_chat_history(
+            chat_id=str(chat_id),
+            session_address=str(session_address),
+            query_content=query,
+            answer_content=answer,
+            description=str(exc),
+            task_number=0,
+            seq_number=0,
+        )
+        return {
+            "status": "blocked",
+            "answer": answer,
+            "completed_tasks": 0,
+            "task_list": [],
+            "block_reason": str(exc),
+        }
 
 
 async def _register_mcp_clients(host):
     required_parameters = {
-        "memory":StdioServerParameters(
+        "memory": StdioServerParameters(
             command=sys.executable,
-            args=["-m","Context.mcp_resources"],
+            args=["-m", "Context.mcp_resources"],
             cwd=str(PROJECT_ROOT),
         ),
-        "supervisor_memory":StdioServerParameters(
+        "supervisor_memory": StdioServerParameters(
             command=sys.executable,
-            args=["-m","Context.mcp_supervisor_tools"],
+            args=["-m", "Context.mcp_supervisor_tools"],
             cwd=str(PROJECT_ROOT),
         ),
-        "system":StdioServerParameters(
+        "system": StdioServerParameters(
             command=sys.executable,
-            args=[
-                "-m",
-                "MCP_functions.System_Files.Files_server.mcp_system_server",
-            ],
+            args=["-m", "MCP_functions.System_Files.Files_server.mcp_system_server"],
+            cwd=str(PROJECT_ROOT),
+        ),
+        "collect": StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "MCP_functions.collect_information.mcp_collect_server"],
             cwd=str(PROJECT_ROOT),
         ),
     }
-
-    for client_name,parameters in required_parameters.items():
-        await host.run(parameters,client_name)
-
+    for client_name, parameters in required_parameters.items():
+        await host.run(parameters, client_name)
     try:
         optional_parameters = get_remote_mcp_link()
     except Exception:
         optional_parameters = {}
-
-    for client_name,parameters in optional_parameters.items():
+    for client_name, parameters in optional_parameters.items():
         try:
-            await host.run(parameters,client_name)
+            await host.run(parameters, client_name)
         except Exception:
             continue
 
 
-#description和skill_name的对应逻辑
 SKILL_GUIDE = {
-    "memory_retrieval.md":"",
-
+    "supervisor_plan.md": "生成可执行、可验收的顺序任务计划。",
+    "supervisor_decison.md": "根据验收结论形成后续指导与任务推进决定。",
+    "memory_retrieval.md": "按需恢复聊天、执行和监督历史。",
 }
-
 SKILL_BELONG = {
-    "memory_retrieval.md":(AgentRole.SUPERVISOR),
-
+    "supervisor_plan.md": {AgentRole.SUPERVISOR},
+    "supervisor_decison.md": {AgentRole.SUPERVISOR},
+    "memory_retrieval.md": {AgentRole.SUPERVISOR},
 }
-def _load_skills(skills_route:str,agentRole:AgentRole):
+
+
+def _load_skills(skills_route, agent_role):
     skills_route = Path(skills_route)
     if not skills_route.exists():
-        raise FileExistsError(f"{skills_route} does not exist,please provide a valid path")
-
+        raise FileNotFoundError(f"{skills_route} does not exist")
     if not skills_route.is_dir():
         raise NotADirectoryError(f"{skills_route} is not a directory")
     skill_gather = []
-    start = 0
-    for item in skills_route.iterdir():
-        if item.is_file():
-            if agentRole in SKILL_BELONG.get(item.name):
-                skill = Skill(
-                    id = start,
-                    name = item.name,
-                    description=SKILL_GUIDE.get(item.name),
-                    address=item.root,
-                    belong=agentRole,
-                )
-                start += 1
-                skill_gather.append(skill)
-
+    for item in sorted(skills_route.iterdir(), key=lambda path: path.name.lower()):
+        if not item.is_file() or agent_role not in SKILL_BELONG.get(item.name, set()):
+            continue
+        skill_gather.append(
+            Skill(
+                id=len(skill_gather),
+                name=item.name,
+                description=SKILL_GUIDE.get(item.name, ""),
+                address=str(item.resolve()),
+                belong=agent_role,
+            )
+        )
     return skill_gather
 
 
-def _build_model_client(provider,api_key):
+def _build_model_client(provider, api_key):
     client_map = {
-        "glm":ZhipuAiClient,
-        "chatgpt":OpenAI,
-        "deepseek":OpenAI,
-        "qwen":OpenAI,
-        "claude":Anthropic,
+        "glm": ZhipuAiClient,
+        "chatgpt": OpenAI,
+        "deepseek": OpenAI,
+        "qwen": OpenAI,
+        "claude": Anthropic,
     }
     base_urls = {
-        "deepseek":"https://api.deepseek.com",
-        "qwen":"https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "deepseek": "https://api.deepseek.com",
+        "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     }
     client_type = client_map.get(provider)
     if client_type is None:
         raise ValueError(f"unsupported model provider: {provider}")
-
-    arguments = {"api_key":api_key}
+    arguments = {"api_key": api_key}
     if provider in base_urls:
         arguments["base_url"] = base_urls[provider]
     return client_type(**arguments)
 
 
-def _close_model_client(client):
-    close = getattr(client,"close",None)
-    if callable(close):
-        close()
+async def _close_model_client(client):
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
 
 
 def _chat_map():
     return {
-        "glm":zhipu_chat,
-        "chatgpt":chatGpt_chat,
-        "qwen":qwen_chat,
-        "claude":claude_chat,
-        "deepseek":deepseek_chat,
+        "glm": zhipu_chat,
+        "chatgpt": chatGpt_chat,
+        "qwen": qwen_chat,
+        "claude": claude_chat,
+        "deepseek": deepseek_chat,
     }

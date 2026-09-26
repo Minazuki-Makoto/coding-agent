@@ -15,6 +15,22 @@
 
 2026-09-22 核对范围：项目目录、五个 AgentChat 模块、MCP Host/通用客户端/服务启动配置、状态保存模块。第 13 节记录当前聊天接口和最新集成边界；第 3～5 节已按当前 MCP 配置和通用客户端重写。Java 工具内部实现本轮未全面复核。
 
+## 0. 2026-09-26 AgentLoop 闭环修复
+
+- 按 `codex_agentloop_repair_guide.md` 保留 Agent 主调度、Supervisor 规划/验收/决策、Executor 执行的既定职责，没有合并角色或恢复旧查错 Agent。
+- `AgentLoop/agent.py` 已补全状态默认值与主循环；配置改为启动时读取，MCP 和模型客户端生命周期覆盖整个任务，并加入任务尝试、角色回合和模型请求预算。
+- `executor_loop.py` 已接通“选择动作—单工具调用—真实观察—结构化总结—JSONL 保存”，纯 JSON 输出也会解析；工具事实先保存，工具后总结失败只重试总结，不重复工具。
+- `supervisor_loop.py` 保留 planning、evaluation、decision 三段职责。首次规划后直接指导第 0 项；Executor 自报完成必须经 evaluation，task 推进由主循环统一应用。
+- 模型适配调用统一经异步线程封装；工具观察按 OpenAI 兼容协议或 Claude tool_use/tool_result 协议回传。每步多工具调用会被拒绝且不会静默丢弃。
+- Executor 上下文只保留最近 10 条观察后 description；完整工具参数、规范化结果、错误、退出原因和监督引用写入 JSONL。
+- 历史契约区分工具成功、Executor 回合完成和 Supervisor 通过；Supervisor 结论以追加 review 记录关联本轮全部 executor seq，旧 `is_solved` 记录仍可读取。
+- MCP 规范工具名统一为 `read_history_chat`；Supervisor 保持只读历史权限，Executor 不获得历史工具权限。
+- Skills 按确定顺序登记真实完整路径；当前三个 skill 均属于 Supervisor，Executor skill 列表允许为空。规划正文从项目相对路径 `Skills/supervisor_plan.md` 加载。
+- 新增 `tests/test_agent_loop.py` 假模型/假 ToolRegistry 测试。离线验证覆盖工具只执行一次、总结重试、工具失败、纯 JSON、10 条窗口、非法 skill、监督否决、历史 review、权限和连续两个任务最终退出。
+- 新增 `SupervisorDescriptionHistory`：按 seq/task/phase 收集每个 Supervisor turn 的 description。任务结束前由 Supervisor 以无工具请求生成最终上下文摘要；汇总失败不改变任务成败，退回最近记录的确定性摘要。聊天 JSONL 同时保存最终 description 与结构化 `supervisor_descriptions`，角色工具证据仍保留在各自历史文件中。
+- 2026-09-26 实际验证：31 个 Python 文件 AST 解析通过，目标模块导入通过，17 个确定性测试通过。未调用真实付费模型、远程 MCP 或用户项目写操作；真实端到端连接仍待单独验证。
+- `backend.py` 原有字符串转义警告不属于本次闭环修复范围，未修改。
+
 ## 1. 项目目标与工作习惯
 
 - 构建由 LLM 参与决策、通过 MCP 工具完成搜索、文件操作和命令执行的 coding agent。

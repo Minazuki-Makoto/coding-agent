@@ -34,10 +34,17 @@ def read_task_all_history(
     pointed_history = []
     for key, history in records.items():
         if history["task_id"] == task_id:
-            supervisor = history.get("supervisor") or {}
-            if key not in invalid and history.get("is_solved") is True:
+            if (
+                key not in invalid
+                and key not in pending
+                and history.get("record_type", "executor_turn") == "executor_turn"
+            ):
                 pointed_history.append({
-                    "description": supervisor.get("description_content", ""),
+                    "description": (
+                        history.get("description")
+                        or history.get("output_content")
+                        or ""
+                    ),
                     "locator": {
                         "session_address": session_directory,
                         "chat_id": chat_id,
@@ -47,11 +54,11 @@ def read_task_all_history(
                 })
             elif key in invalid and key in pending:
                 notice = invalid[key]
-                reason = notice.get("supervisor") or {}
                 pointed_history.append({
                     "description": "旧结论已失效，问题待解决：" + (
-                        reason.get("supervisor_judge_message") or
-                        reason.get("description_content") or "请按编号回查"
+                        notice.get("reason")
+                        or notice.get("description")
+                        or "请按编号回查"
                     ),
                     "locator": {
                         "session_address": session_directory,
@@ -85,18 +92,24 @@ def read_chat_history(
     pointed_history = []
     for key, history in records.items():
         if history["task_id"] < task_id:
-            supervisor = history.get("supervisor") or {}
-            if key not in invalid and history.get("is_solved") is True:
+            if (
+                key not in invalid
+                and key not in pending
+                and history.get("record_type", "executor_turn") == "executor_turn"
+            ):
                 pointed_history.append({
                     "task_id": history["task_id"],
                     "seq": history["seq"],
                     "target": history.get("target"),
                     "tool_name": history.get("tool_name"),
-                    "description": supervisor.get("description_content", ""),
+                    "description": (
+                        history.get("description")
+                        or history.get("output_content")
+                        or ""
+                    ),
                 })
             elif key in invalid and key in pending:
                 notice = invalid[key]
-                reason = notice.get("supervisor") or {}
                 pointed_history.append({
                     "task_id": history["task_id"],
                     "seq": history["seq"],
@@ -104,8 +117,9 @@ def read_chat_history(
                     "status": "unresolved_invalidated",
                     "invalidated_by": {"task_id": notice["task_id"], "seq": notice["seq"]},
                     "description": "旧结论已失效，问题待解决：" + (
-                        reason.get("supervisor_judge_message") or
-                        reason.get("description_content") or "请按编号回查"
+                        notice.get("reason")
+                        or notice.get("description")
+                        or "请按编号回查"
                     ),
                 })
     return pointed_history

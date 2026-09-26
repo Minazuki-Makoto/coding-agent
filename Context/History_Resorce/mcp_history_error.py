@@ -24,13 +24,17 @@ def read_question_task(
             continue
         history = original.copy()
         history.pop("chat_id", None)
-        supervisor = history.get("supervisor") or {}
-        history["description"] = supervisor.get("description_content", "")
+        history["description"] = (
+            history.get("description") or history.get("output_content") or ""
+        )
         if key in invalid:
             notice = invalid[key]
-            supervisor = notice.get("supervisor") or {}
             history["invalidated_by"] = {"task_id": notice["task_id"], "seq": notice["seq"]}
-        history["update_advice"] = supervisor.get("supervisor_judge_message", "")
+            history["update_advice"] = (
+                notice.get("reason") or notice.get("description") or ""
+            )
+        else:
+            history["update_advice"] = history.get("review_reason", "")
         pointed_history.append(history)
     return pointed_history
 

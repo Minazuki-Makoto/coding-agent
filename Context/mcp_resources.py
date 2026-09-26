@@ -5,7 +5,7 @@ from mcp import StdioServerParameters
 from Context.History_Resorce.mcp_history_resource_service import (
 read_task_all_history,
 read_chat_history,
-read_history_chat
+read_history_chat as _read_history_chat
 )
 
 from Context.History_Resorce.mcp_history_error import (
@@ -53,15 +53,19 @@ async def read_history_task(
     )
 
 @mcp_server.tool(
-    name = "read_history_chat_resource",
+    name = "read_history_chat",
     description=(
-        "Use to recover conversation history or inspect chat records saved in one known session directory. session_address is the existing session directory containing the history files, not a file path or URI; pass it unchanged without URL encoding. Use the session_address supplied by the host or task context. Returns all JSON records in that directory's chat_history.jsonl, without filtering by chat_id or task_id. It does not read executor_history.jsonl or discover other session directories. For execution summaries use read_now_task or read_history_task; for unresolved execution problems use read_task_history_error. Despite its name, this is a callable tool, not an MCP resource."
+        "Use only when the current input lacks necessary user constraints or prior decisions. session_address is the known session directory containing chat_history.jsonl; pass it unchanged. Optionally pass the host-provided chat_id to filter records and preserve leading zeroes. It does not read executor history. When the current input is sufficient, skip this tool."
     )
 )
-async def read_history_chat_resource(
-        session_address:str
+async def read_history_chat(
+        session_address:str,
+        chat_id:str | None = None,
 ):
-    return read_history_chat(session_address)
+    records = _read_history_chat(session_address)
+    if chat_id is None or not isinstance(records,list):
+        return records
+    return [record for record in records if record.get("chat_id") == chat_id]
 
 @mcp_server.tool(
     name = "read_task_history_error",

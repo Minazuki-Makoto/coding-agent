@@ -25,7 +25,7 @@ description: 根据用户需求、executor 当前实际可用的工具和 skill 
 | `find_the_python_editor_tool` | 在指定目录递归查找可运行的 Windows python.exe，返回解释器路径。 |
 | `run_code_get_feedback_tool` | 使用指定解释器运行 Python 文件，返回输出、错误和退出码等反馈，超时为 10 秒。 |
 | `download_package_with_confirmation_tool` | 确认后向指定 Python 环境安装依赖；当前确认交互需修复，见下方说明。 |
-| `get_needed_info_tool` | 设计用于读取用户配置，但当前只返回占位数据，主循环也未接入该服务；不能依赖它获取配置。 |
+| `get_needed_info_tool` | 当前只返回传入的占位数据；虽然服务已注册，仍不能依赖它获取真实配置。 |
 
 打包与安装工具的 MCP 包装当前传入 `interactive=True`，会尝试通过 stdin 读取确认，与 stdio MCP 通信冲突；Host 确认流程修复前，将对应操作视为受阻能力。
 
@@ -45,8 +45,7 @@ description: 根据用户需求、executor 当前实际可用的工具和 skill 
 
 ## 输出
 
-最终只输出 JSON，`task_list` 为按执行顺序排列的非空字符串列表。无需额外解释，不添加 Markdown 围栏。
-`description`每轮都需要带上，负责对于你这一轮执行的操作，以及为什么选择这个操作等等方面进行总结，不能失去重点，但最好精炼
+最终只输出 JSON，仅包含 `task_list` 与 `description`。其中 `task_list` 为按执行顺序排列的非空字符串列表；`description` 精炼说明本轮规划依据。无需额外解释，不添加 Markdown 围栏。
 
 以下仅示例格式；实际任务应按用户要求和可用工具生成：
 

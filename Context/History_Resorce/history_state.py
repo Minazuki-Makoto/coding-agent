@@ -2,39 +2,71 @@ import json
 
 
 def read_memory_state(path, chat_id):
-    """恢复同chat的原记录、失效声明、待处理问题；唯一键为(task_id, seq)。
+    """Rebuild executor records, invalidations and unresolved records.
 
-    旧记录不改。按追加顺序关联；失效声明持续有效，不自动撤回。
-    后来失效的修复记录不再消除旧问题。
+    New records stay pending until an explicit supervisor_review references them.
+    Legacy is_solved/invalidates/repairs records remain readable.
     """
     records = {}
     invalid = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+    pending = {}
+    accepted = set()
+    ordered = []
+
+    with open(path, "r", encoding="utf-8") as history_file:
+        for line_number, line in enumerate(history_file, 1):
             if not line.strip():
                 continue
             record = json.loads(line)
             if not isinstance(record, dict) or record.get("chat_id") != chat_id:
                 continue
-            # 只接受指向已出现记录的关联。
-            for ref in record.get("invalidates") or []:
-                key = (ref["task_id"], ref["seq"])
-                if key in records:
-                    invalid[key] = record
-            records[(record["task_id"], record["seq"])] = record
+            record_type = record.get("record_type")
+            if record_type == "supervisor_review":
+                task_id = record.get("task_id")
+                for seq in record.get("reviewed_executor_seqs") or []:
+                    key = (task_id, seq)
+                    if record.get("is_passed") is True:
+                        accepted.add(key)
+                        pending.pop(key, None)
+                    else:
+                        accepted.discard(key)
+                        if key in records:
+                            pending[key] = {
+                                **records[key],
+                                "review_reason": record.get("reason", ""),
+                                "review_supervisor_seq": record.get("supervisor_seq"),
+                            }
+                continue
 
-    # 先得到最终失效集合，再计算修复效果，避免失效修复继续消除问题。
-    pending = {}
-    seen = set()
-    for key, record in records.items():
-        for ref in record.get("invalidates") or []:
-            target = (ref["task_id"], ref["seq"])
-            if target in seen:
-                pending[target] = records[target]
-        if record.get("is_solved") is True and key not in invalid:
-            for ref in record.get("repairs") or []:
-                pending.pop((ref["task_id"], ref["seq"]), None)
-        if record.get("is_solved") is False:
+            task_id, seq = record.get("task_id"), record.get("seq")
+            if type(task_id) is not int or type(seq) is not int:
+                continue
+            key = (task_id, seq)
+            records[key] = record
+            ordered.append((key, record))
+            if record.get("record_type") in {"tool_event", "executor_turn"}:
+                pending[key] = record
+            if record.get("tool_ok") is False or record.get("is_error") is True:
+                pending[key] = record
+
+            for reference in record.get("invalidates") or []:
+                target = (reference.get("task_id"), reference.get("seq"))
+                if target in records:
+                    invalid[target] = record
+                    pending[target] = records[target]
+            if record.get("is_solved") is True:
+                accepted.add(key)
+                pending.pop(key, None)
+            elif record.get("is_solved") is False:
+                pending[key] = record
+
+    for key, record in ordered:
+        if key in invalid:
+            accepted.discard(key)
             pending[key] = record
-        seen.add(key)
+            continue
+        if key not in accepted:
+            continue
+        for reference in record.get("repairs") or []:
+            pending.pop((reference.get("task_id"), reference.get("seq")), None)
     return records, invalid, pending
