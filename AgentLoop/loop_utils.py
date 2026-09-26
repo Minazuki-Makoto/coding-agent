@@ -30,7 +30,6 @@ def call_chat_function(
         tools:list[dict],
         temperature:float
 ):
-    check_context_size(messages,tools)
 
     arguments = {
         "query":messages,
@@ -74,21 +73,7 @@ def build_model_messages(provider:str,prompt:str,information:dict):
     ]
 
 
-def check_context_size(messages:list[dict],tools:list[dict]):
-    content = json.dumps(
-        {
-            "messages":messages,
-            "tools":tools,
-        },
-        ensure_ascii=False,
-        default=str
-    )
 
-    if len(content) > MODEL_CONTEXT_MAX_CHARS:
-        raise ValueError(
-            "model input exceeds local context budget: "
-            f"{len(content)} > {MODEL_CONTEXT_MAX_CHARS} characters"
-        )
 
 
 def normalize_tool_calls(provider:str,tool_calls):
@@ -133,37 +118,6 @@ def normalize_tool_calls(provider:str,tool_calls):
 
     return normalized_calls
 
-
-def tool_result_for_context(
-        tool_result:ToolExecutionResult,
-        max_chars:int=TOOL_RESULT_CONTEXT_MAX_CHARS
-):
-    result = tool_result.to_dict()
-    content = json.dumps(
-        result,
-        ensure_ascii=False,
-        default=str
-    )
-
-    if len(content) <= max_chars:
-        return {
-            "truncated":False,
-            "content":result,
-        }
-
-    return {
-        "truncated":True,
-        "original_chars":len(content),
-        "content_preview":bounded_text(
-            content,
-            max_chars=max_chars,
-            keep_tail=True
-        ),
-        "instruction":(
-            "工具结果超过当前上下文预算，只保留首尾。"
-            "请缩小下一次查询范围，不能根据被省略内容作结论。"
-        ),
-    }
 
 
 def bounded_text(value,max_chars:int,keep_tail:bool=False):

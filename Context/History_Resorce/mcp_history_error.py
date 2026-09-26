@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from Context.History_Resorce.history_state import read_memory_state
 
@@ -40,8 +41,18 @@ def read_history_by_seq(
         task_id,
         seq
 ):
-    session_address = Path(session_address)/"executor_history.jsonl"
-    if not session_address.exists():
+    history_path = Path(session_address)/"executor_history.jsonl"
+    print(
+        f"[memory.exact] start chat_id={chat_id} task_id={task_id} seq={seq}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if not history_path.exists():
+        print(
+            f"[memory.exact] history file not found: {history_path}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         return {
             "status": "error",
@@ -49,7 +60,7 @@ def read_history_by_seq(
         }
 
     pointed_history = []
-    with open(session_address, "r", encoding="utf-8") as f:
+    with open(history_path, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
@@ -69,4 +80,9 @@ def read_history_by_seq(
                 supervisor = history.get("supervisor") or {}
                 pointed_history.append(history)
 
+    print(
+        f"[memory.exact] done matches={len(pointed_history)}",
+        file=sys.stderr,
+        flush=True,
+    )
     return pointed_history

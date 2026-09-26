@@ -45,6 +45,7 @@ SUPERVISOR_ONLY_TOOLS = {
     "read_history_chat_resource",
     "read_task_history_error",
     "read_task_error",
+    "read_supervisor_task",
     "read_supervisor_history",
 }
 

@@ -26,7 +26,7 @@ def _references(current_state, name):
 
 def save_state_history(current_state):
     """从 AgentLoop state 保存一条 executor 执行记录。"""
-    task_id = _value(current_state, "now_task_id")
+    task_id = _value(current_state, "task_id")
     seq = _value(current_state, "executor_seq")
     session_address = _value(current_state, "session_address")
     chat_id = _value(current_state, "chat_id")
@@ -39,11 +39,6 @@ def save_state_history(current_state):
     if not isinstance(chat_id, str) or not chat_id:
         raise ValueError("state.chat_id is required")
 
-    repairs = _references(current_state, "repaired")
-    invalidates = _references(current_state, "invalid")
-    own = {"task_id": task_id, "seq": seq}
-    if own in repairs or own in invalidates:
-        raise ValueError("state cannot reference its own executor record")
 
     session_address = Path(session_address)
     session_address.mkdir(parents=True, exist_ok=True)
@@ -53,24 +48,19 @@ def save_state_history(current_state):
         "chat_id": chat_id,
         "task_id": task_id,
         "target": target,
+        "supervisor_guidance":_value(current_state, "supervisor_guidance",""),
         "tool_name": _value(current_state, "tool", ""),
-        "exists_error": bool(_value(current_state, "is_error", False)),
-        "error_message": _value(current_state, "error_message", ""),
+
         "input_content": _value(
-            current_state, "tool_input", _value(current_state, "tool_input", "")
+            current_state, "input_content",""
         ),
 
-        "output_content": _value(current_state, "tool_results", ""),
+        "output_content": _value(current_state, "output_content", ""),
 
-        "supervisor": {
-            "description_content": _value(current_state, "supervisor_description", ""),
-            "supervisor_judge_error": not bool(_value(current_state, "supervisor_check", False)),
-            "supervisor_judge_message": _value(current_state, "supervisor_error_advice", ""),
-        },
-
-        "is_solved": bool(_value(current_state, "supervisor_check", False)),
-        "repairs": repairs,
-        "invalidates": invalidates,
+        "is_finished": bool(_value(current_state, "is_finished", False)),
+        "is_error":bool(_value(current_state, "is_error", False)),
+        "error_message": _value(current_state, "error_message", ""),
+        "memory_window": _value(current_state, "memory_window"),
     }
 
     with (session_address / "executor_history.jsonl").open("a", encoding="utf-8") as history_file:

@@ -23,6 +23,48 @@ def get_zhipu_api():
             "message":str(e)
         }
 
+
+def _get_completion_message(response):
+    if isinstance(response,dict):
+        choices = response.get("choices") or []
+    else:
+        choices = getattr(response,"choices",None) or []
+
+    if not choices:
+        raise ValueError("GLM response does not contain choices")
+
+    first_choice = choices[0]
+    if isinstance(first_choice,dict):
+        message = first_choice.get("message")
+    else:
+        message = getattr(first_choice,"message",None)
+
+    if message is None:
+        raise ValueError("GLM response choice does not contain message")
+
+    return message
+
+
+def _get_message_field(message,field_name,default=None):
+    if isinstance(message,dict):
+        return message.get(field_name,default)
+    return getattr(message,field_name,default)
+
+
+def _serialize_tool_call(tool_call):
+    if isinstance(tool_call,dict):
+        return tool_call
+
+    if hasattr(tool_call,"model_dump"):
+        return tool_call.model_dump(exclude_none=True)
+
+    if hasattr(tool_call,"dict"):
+        return tool_call.dict(exclude_none=True)
+
+    raise ValueError(
+        f"unsupported GLM tool call type: {type(tool_call).__name__}"
+    )
+
 def zhipu_chat(
         client: ZhipuAiClient,
         model:str,
@@ -43,11 +85,15 @@ def zhipu_chat(
             }
         )
 
-
+        message = _get_completion_message(response)
+        tool_calls = _get_message_field(message,"tool_calls",[]) or []
         return {
             "status": "success",
-            "message": response.choices[0].message.content,
-            "tool": response["choices"][0]["message"].get("tool_calls") or []
+            "message": _get_message_field(message,"content"),
+            "tool": [
+                _serialize_tool_call(tool_call)
+                for tool_call in tool_calls
+            ]
         }
 
     except Exception as e:
@@ -56,7 +102,3 @@ def zhipu_chat(
                 "message": str(e),
                 "tool": []
             }
-
-
-
-

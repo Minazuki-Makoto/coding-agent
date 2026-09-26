@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from Context.History_Resorce.history_state import read_memory_state
 
@@ -13,7 +14,17 @@ def read_task_all_history(
 ):
     session_directory = str(session_address)
     history_path = Path(session_directory)/"executor_history.jsonl"
+    print(
+        f"[memory.summary] start chat_id={chat_id} task_id={task_id}",
+        file=sys.stderr,
+        flush=True,
+    )
     if not history_path.exists():
+        print(
+            f"[memory.summary] history file not found: {history_path}",
+            file=sys.stderr,
+            flush=True,
+        )
         return {
             "status":"error",
             "message":"the address of history savings is not valid"
@@ -49,6 +60,11 @@ def read_task_all_history(
                         "seq": history["seq"],
                     },
                 })
+    print(
+        f"[memory.summary] done candidates={len(pointed_history)}",
+        file=sys.stderr,
+        flush=True,
+    )
     return pointed_history
 
 
