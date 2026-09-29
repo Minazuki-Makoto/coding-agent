@@ -67,8 +67,8 @@ SUPERVISOR_ONLY_TOOLS = {
 
 SHARED_READ_ONLY_TOOLS = {
     "read_all_files_tool",
+    "read_files_content_tool",
     "sort_files_by_suffix_tool",
-    "sort_files_by_mother_tool",
 }
 
 EXECUTOR_ONLY_TOOLS = {

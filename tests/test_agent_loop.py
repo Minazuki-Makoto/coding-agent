@@ -15,7 +15,12 @@ from AgentLoop.agent import (
     SupervisorDescriptionHistory,
     main,
 )
-from AgentLoop.executor_loop import SelectedSkill, _load_selected_skill, run_executor_loop
+from AgentLoop.executor_loop import (
+    ExecutorOutPut,
+    SelectedSkill,
+    _load_selected_skill,
+    run_executor_loop,
+)
 from AgentLoop.supervisor_loop import (
     DateBack,
     SupervisorDecisionResult,
@@ -111,6 +116,77 @@ def make_states(directory, max_steps=3):
 
 
 class ExecutorLoopTests(unittest.IsolatedAsyncioTestCase):
+    def test_executor_output_requires_is_finished(self):
+        with self.assertRaises(ValueError):
+            ExecutorOutPut.model_validate(
+                {
+                    "description": "GLM 漏掉了完成状态",
+                }
+            )
+
+    def test_executor_output_rejects_blank_description_and_string_bool(self):
+        with self.assertRaises(ValueError):
+            ExecutorOutPut.model_validate(
+                {
+                    "description": "   ",
+                    "is_finished": False,
+                }
+            )
+        with self.assertRaises(ValueError):
+            ExecutorOutPut.model_validate(
+                {
+                    "description": "字段类型错误",
+                    "is_finished": "false",
+                }
+            )
+
+    def test_selected_skill_requires_name_and_id_together(self):
+        with self.assertRaises(ValueError):
+            SelectedSkill.model_validate(
+                {
+                    "skill_name": "example.md",
+                    "skill_id": None,
+                }
+            )
+
+    async def test_plain_json_validation_error_is_fed_back_and_retried(self):
+        with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
+            agent, supervisor, executor, _ = make_states(directory)
+            chat = QueueChat(
+                [
+                    model_response(
+                        json_message(
+                            description="   ",
+                            is_finished=False,
+                        )
+                    ),
+                    model_response(
+                        json_message(
+                            description="纠正后返回完整有效结果",
+                            is_finished=True,
+                        )
+                    ),
+                ]
+            )
+            registry = FakeRegistry()
+            await run_executor_loop(
+                agent,
+                "chatgpt",
+                object(),
+                chat,
+                [],
+                registry,
+                [],
+                supervisor,
+                executor,
+            )
+            self.assertEqual(registry.calls, [])
+            self.assertEqual(len(chat.calls), 2)
+            self.assertTrue(executor.is_finished)
+            second_information = chat.calls[1]["query"][-1]["content"]
+            self.assertIn("Executor 响应校验失败", second_information)
+            self.assertIn("description", second_information)
+
     async def test_tool_runs_once_and_bool_is_used_directly(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
             agent, supervisor, executor, _ = make_states(directory)
@@ -150,6 +226,11 @@ class ExecutorLoopTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(records[0]["arguments"], {"path": "x"})
             self.assertTrue(records[0]["tool_ok"])
+            self.assertIn("model_stage", records[0])
+            self.assertIn("raw_model_response_excerpt", records[0])
+            self.assertIn("validation_error", records[0])
+            self.assertEqual(records[-1]["model_stage"], "tool_summary")
+            self.assertEqual(records[-1]["task_attempt"], 0)
 
     async def test_bad_summary_retries_without_reexecuting_tool(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
@@ -182,6 +263,17 @@ class ExecutorLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(registry.calls), 1)
             self.assertEqual(len(chat.calls), 3)
             self.assertIn("第二次总结成功", executor.output_content)
+            correction = chat.calls[2]["query"][-1]["content"]
+            self.assertIn("validation_errors", correction)
+            self.assertIn("is_finished", correction)
+            records = [
+                json.loads(line)
+                for line in Path(directory, "executor_history.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertIn("Expecting value", records[-1]["validation_error"])
+            self.assertIn("第二次总结成功", records[-1]["raw_model_response_excerpt"])
 
     async def test_plain_json_and_window_are_bounded(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
@@ -260,10 +352,12 @@ class ExecutorLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(records[0]["error_message"], "boom")
 
     def test_invalid_skill_selection_is_finite(self):
+        with self.assertRaises(ValueError):
+            SelectedSkill(skill_name="missing.md", skill_id=-1)
         self.assertIsNone(
             _load_selected_skill(
                 [],
-                SelectedSkill(skill_name="missing.md", skill_id=-1),
+                SelectedSkill(skill_name="missing.md", skill_id=99),
             )
         )
 
@@ -351,6 +445,89 @@ class ExecutorLoopTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SupervisorLoopTests(unittest.IsolatedAsyncioTestCase):
+    def test_decision_rejects_misspelled_is_next_target(self):
+        with self.assertRaises(ValueError):
+            SupervisorDecisionResult.model_validate(
+                {
+                    "is_next_targte": True,
+                    "description": "推进下一任务",
+                    "is_finished": True,
+                }
+            )
+
+    def test_decision_cannot_advance_by_description_without_control_field(self):
+        with self.assertRaises(ValueError):
+            SupervisorDecisionResult.model_validate(
+                {
+                    "description": "当前任务已经完成，推进下一任务",
+                    "is_finished": True,
+                }
+            )
+
+    async def test_invalid_decision_is_saved_then_retried_without_advancing(self):
+        with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
+            agent, supervisor, executor, evaluation = make_states(directory)
+            executor.output_content = "执行证据"
+            executor.passed_seq_list = [1]
+            chat = QueueChat(
+                [
+                    model_response(
+                        json_message(
+                            is_passed=True,
+                            description="证据充分",
+                            is_error=False,
+                            reason="",
+                            is_finished=True,
+                        )
+                    ),
+                    model_response(
+                        json_message(
+                            description="当前任务完成，应推进下一任务",
+                            is_finished=True,
+                        )
+                    ),
+                    model_response(
+                        json_message(
+                            is_next_target=True,
+                            description="补全控制字段后允许推进",
+                            is_finished=True,
+                        )
+                    ),
+                ]
+            )
+            decision = await run_supervisor_loop(
+                agent,
+                "chatgpt",
+                object(),
+                chat,
+                [],
+                FakeRegistry(),
+                [],
+                supervisor,
+                evaluation,
+                executor,
+            )
+            self.assertTrue(decision.is_next_target)
+            records = [
+                json.loads(line)
+                for line in Path(directory, "supervisor_history.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            parse_error = next(
+                item
+                for item in records
+                if item["record_type"] == "decision_validation_error_turn"
+            )
+            self.assertFalse(parse_error["is_next_target"])
+            self.assertIn("is_next_target", parse_error["validation_error"])
+            self.assertIn(
+                "应推进下一任务", parse_error["raw_model_response_excerpt"]
+            )
+            final_decision = records[-1]
+            self.assertTrue(final_decision["is_next_target"])
+            self.assertTrue(final_decision["decision_finished"])
+
     async def test_supervisor_descriptions_are_summarized_and_persistable(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
             agent, supervisor, _, _ = make_states(directory)
@@ -394,12 +571,20 @@ class SupervisorLoopTests(unittest.IsolatedAsyncioTestCase):
                 supervisor_descriptions=(
                     agent.supervisor_descriptions.to_dicts()
                 ),
+                total_tokens=321,
+                elapsed_time_seconds=4.25,
+                started_at="2026-09-29T10:00:00",
+                finished_at="2026-09-29T10:00:04",
             )
             record = json.loads(
                 Path(directory, "chat_history.jsonl").read_text(encoding="utf-8")
             )
             self.assertEqual(record["description"], description)
             self.assertEqual(len(record["supervisor_descriptions"]), 3)
+            self.assertEqual(record["total_tokens"], 321)
+            self.assertEqual(record["elapsed_time_seconds"], 4.25)
+            self.assertEqual(record["started_at"], "2026-09-29T10:00:00")
+            self.assertEqual(record["finished_at"], "2026-09-29T10:00:04")
 
     async def test_first_request_plans_then_guides_task_zero_without_evaluation(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
@@ -579,6 +764,7 @@ class SupervisorLoopTests(unittest.IsolatedAsyncioTestCase):
         valid = SupervisorDecisionResult(
             is_task_list_need_change=True,
             new_task_list=["done", "current revised", "new later"],
+            is_next_target=False,
             date_back_location=[
                 DateBack(
                     seq=2,
@@ -593,6 +779,7 @@ class SupervisorLoopTests(unittest.IsolatedAsyncioTestCase):
         invalid = SupervisorDecisionResult(
             is_task_list_need_change=True,
             new_task_list=["rewritten", "current"],
+            is_next_target=False,
         )
         with self.assertRaises(ValueError):
             _validate_decision_plan(agent, invalid)
@@ -698,6 +885,13 @@ class MainSchedulingTests(unittest.IsolatedAsyncioTestCase):
                 events,
                 ["plan", "execute-0", "supervise-0", "execute-1", "supervise-1"],
             )
+            history_record = json.loads(
+                Path(directory, "chat_history.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(history_record["total_tokens"], 0)
+            self.assertGreaterEqual(history_record["elapsed_time_seconds"], 0)
+            self.assertTrue(history_record["started_at"])
+            self.assertTrue(history_record["finished_at"])
 
     async def test_same_task_attempt_limit_returns_blocked(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
@@ -831,10 +1025,19 @@ class HistoryAndPermissionTests(unittest.TestCase):
                         "parameters": {},
                     },
                 },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_files_content_tool",
+                        "description": "",
+                        "parameters": {},
+                    },
+                },
             ]
             tool_dictionary = {
                 "read_history_chat": "memory",
                 "write_in_tool": "system",
+                "read_files_content_tool": "system",
             }
             session_dictionary = {}
 
@@ -851,6 +1054,8 @@ class HistoryAndPermissionTests(unittest.TestCase):
         self.assertNotIn("write_in_tool", supervisor_names)
         self.assertIn("write_in_tool", executor_names)
         self.assertNotIn("read_history_chat", executor_names)
+        self.assertIn("read_files_content_tool", supervisor_names)
+        self.assertIn("read_files_content_tool", executor_names)
 
         skills = _load_skills(
             Path(__file__).resolve().parents[1] / "Skills", AgentRole.SUPERVISOR

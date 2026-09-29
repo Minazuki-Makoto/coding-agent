@@ -65,6 +65,14 @@ def _serialize_tool_call(tool_call):
         f"unsupported GLM tool call type: {type(tool_call).__name__}"
     )
 
+
+def _get_total_tokens(response):
+    usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+    if usage is None:
+        return 0
+    total_tokens = usage.get("total_tokens", 0) if isinstance(usage, dict) else getattr(usage, "total_tokens", 0)
+    return total_tokens if isinstance(total_tokens, int) else 0
+
 def zhipu_chat(
         client: ZhipuAiClient,
         model:str,
@@ -90,6 +98,7 @@ def zhipu_chat(
         return {
             "status": "success",
             "message": _get_message_field(message,"content"),
+            "total_tokens": _get_total_tokens(response),
             "tool": [
                 _serialize_tool_call(tool_call)
                 for tool_call in tool_calls
@@ -100,5 +109,6 @@ def zhipu_chat(
             return {
                 "status": "error",
                 "message": str(e),
+                "total_tokens": 0,
                 "tool": []
             }

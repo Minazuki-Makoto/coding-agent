@@ -49,6 +49,21 @@ def save_supervisor_state_history(current_state, record_type: str = "supervisor_
         "date_back_locations": _value(current_state, "date_back_locations", []),
         "date_back_input": _value(current_state, "date_back_input", ""),
         "modify_content": _value(current_state, "modify_content", ""),
+        "verification_requirement": _value(
+            current_state, "verification_requirement", ""
+        ),
+        "is_next_target": bool(_value(current_state, "is_next_target", False)),
+        "decision_finished": bool(
+            _value(current_state, "decision_finished", False)
+        ),
+        "proposed_task_list": _value(current_state, "proposed_task_list"),
+        "final_answer": _value(current_state, "final_answer", ""),
+        "task_attempt": _value(current_state, "task_attempt", 0),
+        "model_stage": _value(current_state, "model_stage", ""),
+        "raw_model_response_excerpt": _value(
+            current_state, "raw_model_response_excerpt", ""
+        ),
+        "validation_error": _value(current_state, "validation_error", ""),
         "exit_reason": _value(current_state, "exit_reason", ""),
     }
     with (session_address / "supervisor_history.jsonl").open(

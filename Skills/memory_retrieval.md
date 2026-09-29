@@ -17,7 +17,6 @@ supervisor 在每次重新接手任务后，通过本技能恢复当前任务所
 ### 1. 读取当前任务摘要
 
 调用：
-
 ```python
 read_now_task(session_address, chat_id, task_id)
 ```

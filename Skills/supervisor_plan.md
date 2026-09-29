@@ -13,10 +13,10 @@ description: 根据用户需求、executor 当前实际可用的工具和 skill 
 
 | 工具名称 | 作用及必要限制 |
 | --- | --- |
-| `read_all_files_tool` | 递归读取指定目录的文件信息和文本；传单个文件时仅返回元数据，不返回正文。 |
+| `read_all_files_tool` | 只浏览目标路径的单层目录结构和文件元数据，不读取正文；需要深入时用返回的子目录 `address` 连续调用，并按 `next_start_index` 翻页。 |
+| `read_files_content_tool` | 读取指定文件的可续读正文，或非递归读取指定目录的直接文件；文件按 `next_start_char` 续读，目录按 `next_start_index` 翻页，不用它递归倾倒整个项目。 |
 | `sort_files_by_suffix_tool` | 将读取结果按文件后缀分组，辅助识别源码和构建配置。 |
-| `sort_files_by_mother_tool` | 原意为按父目录分组，但当前实现仍按后缀分组，不能用于判断目录层级。 |
-| `judge_spring_project_tool` | 静态识别 Spring／Spring Boot、构建方式和声明的 JDK 版本，返回证据与警告；不执行构建。 |
+| `judge_spring_project_tool` | 完整解析本地 `pom.xml`（不受目录扫描预览截断影响），静态识别 Spring／Spring Boot、Maven/Java/Boot 版本、依赖、插件、模块和 profiles；不执行构建或解析外部父 POM。 |
 | `find_java_exe_tool` | 在指定目录递归查找可用的 Windows JDK，返回通过版本检查的 java.exe、javac.exe 路径。 |
 | `run_java_get_feedback` | 编译并运行没有 package 声明的独立 Java 文件，返回输出或错误；不用于运行整个 Spring 项目。 |
 | `package_spring_boot_with_confirmation_tool` | 确认后通过 Maven／Gradle 打包 Spring Boot 项目，并将 JAR 复制到指定目录；当前确认交互需修复，见下方说明。 |
@@ -52,8 +52,8 @@ description: 根据用户需求、executor 当前实际可用的工具和 skill 
 ```json
 {
   "task_list": [
-    "使用 read_all_files_tool 读取用户指定项目目录，确认入口和主要模块；完成依据为实际文件内容能够支持模块职责与调用关系。",
-    "根据已读取的源码整理项目功能、模块分工和主要执行流程，引用关键文件与符号，并标明尚未确认的内容。"
+    "使用 read_all_files_tool 分层浏览用户指定项目目录，定位入口、构建文件和主要模块；避免对同一路径重复读取。",
+    "使用 read_files_content_tool 定向读取上一阶段发现的关键源码；完成依据为实际文件内容能够支持模块职责与调用关系，再整理执行流程并标明尚未确认的内容。"
   ],
   "description": ""
 }

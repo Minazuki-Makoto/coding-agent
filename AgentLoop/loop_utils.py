@@ -53,11 +53,16 @@ def normalize_chat_response(response: Any) -> dict[str, Any]:
             "status": "error",
             "message": f"model adapter returned {type(response).__name__}, expected dict",
             "tool": [],
+            "total_tokens": 0,
         }
+    total_tokens = response.get("total_tokens", 0)
+    if not isinstance(total_tokens, int) or isinstance(total_tokens, bool):
+        total_tokens = 0
     return {
         "status": response.get("status", "error"),
         "message": response.get("message"),
         "tool": response.get("tool") or [],
+        "total_tokens": total_tokens,
     }
 
 

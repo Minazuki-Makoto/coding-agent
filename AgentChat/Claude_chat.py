@@ -50,6 +50,7 @@ def claude_chat(
         return {
             "status": "success",
             "message": results,
+            "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
             "tool": [block.model_dump() for block in response.content if block.type == "tool_use"]
         }
 
@@ -57,5 +58,6 @@ def claude_chat(
         return {
             "status": "error",
             "message": str(e),
+            "total_tokens": 0,
             "tool": []
         }

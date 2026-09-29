@@ -51,6 +51,16 @@ def save_state_history(current_state, record_type: str = "tool_event"):
         "is_error": bool(_value(current_state, "is_error", False)),
         "error_message": _value(current_state, "error_message", ""),
         "exit_reason": _value(current_state, "exit_reason", ""),
+        "task_attempt": _value(current_state, "task_attempt", 0),
+        "passed_seq_list": list(
+            _value(current_state, "passed_seq_list", []) or []
+        ),
+        "selected_skill": _value(current_state, "selected_skill"),
+        "model_stage": _value(current_state, "model_stage", ""),
+        "raw_model_response_excerpt": _value(
+            current_state, "raw_model_response_excerpt", ""
+        ),
+        "validation_error": _value(current_state, "validation_error", ""),
         "review_status": "pending",
     }
     _append_record(session_address, record)

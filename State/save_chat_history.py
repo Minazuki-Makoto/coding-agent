@@ -10,6 +10,10 @@ def save_chat_history(
         task_number:int,
         seq_number:int,
         supervisor_descriptions:list[dict] | None = None,
+        total_tokens:int = 0,
+        elapsed_time_seconds:float = 0.0,
+        started_at:str = "",
+        finished_at:str = "",
 ):
     session_address = Path(session_address)
     session_address.mkdir(parents=True,exist_ok=True)
@@ -26,6 +30,10 @@ def save_chat_history(
                     "answer_content":answer_content,
                     "description":description,
                     "supervisor_descriptions":supervisor_descriptions or [],
+                    "total_tokens":total_tokens,
+                    "elapsed_time_seconds":elapsed_time_seconds,
+                    "started_at":started_at,
+                    "finished_at":finished_at,
                 },ensure_ascii=False,
             )+'\n'
         )

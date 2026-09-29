@@ -5,6 +5,7 @@ import json
 import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -110,7 +111,7 @@ class SupervisorDescriptionHistory:
         used = 0
         for entry in reversed(self.entries):
             item = entry.to_dict()
-            item["description"] = item["description"][:2000]
+            item["description"] = item["description"][:3000]
             size = len(json.dumps(item, ensure_ascii=False))
             if selected and used + size > max_chars:
                 break
@@ -161,6 +162,10 @@ class SupervisorState:
     decision_finished: bool = False
     final_answer: str = ""
     exit_reason: str = ""
+    task_attempt: int = 0
+    model_stage: str = ""
+    raw_model_response_excerpt: str = ""
+    validation_error: str = ""
 
 
 @dataclass
@@ -205,6 +210,10 @@ class ExecutorState:
     memory_window: list[str] = field(default_factory=list)
     selected_skill: Skill | None = None
     exit_reason: str = ""
+    task_attempt: int = 0
+    model_stage: str = ""
+    raw_model_response_excerpt: str = ""
+    validation_error: str = ""
 
 
 @dataclass
@@ -221,8 +230,8 @@ class AgentState:
     executor_model: str = ""
     supervisor_model: str = ""
     temperature: float = 0.3
-    max_executor_steps: int = 8
-    max_supervision_times: int = 6
+    max_executor_steps: int = 10
+    max_supervision_times: int = 10
     max_task_attempts: int = 3
     max_model_requests: int = 80
     model_request_count: int = 0
@@ -237,7 +246,7 @@ class AgentState:
     supervisor_descriptions: SupervisorDescriptionHistory = field(
         default_factory=SupervisorDescriptionHistory
     )
-
+    total_token: int = 0
 
 state = AgentState
 
@@ -299,7 +308,12 @@ def state_init(session_address, chat_id, query="", config=None):
     )
 
 
-async def _run_main(query: str, session_address: str, chat_id: str):
+async def _run_main(
+    query: str,
+    session_address: str,
+    chat_id: str,
+    started_at: datetime,
+):
     config = load_runtime_config()
     now_state = state_init(session_address, chat_id, query, config)
     supervisor_state = SupervisorState(
@@ -341,6 +355,10 @@ async def _run_main(query: str, session_address: str, chat_id: str):
                 executor_tools=executor_tools,
                 skill_lists=supervisor_skills,
             )
+
+            print(f"""
+            \n任务列表清单：{now_state.task_list}
+            """)
 
             while now_state.now_task_id < len(now_state.task_list):
                 if now_state.task_attempt >= now_state.max_task_attempts:
@@ -433,6 +451,8 @@ async def _run_main(query: str, session_address: str, chat_id: str):
             )
         )
 
+    finished_at = datetime.now()
+    elapsed_time_seconds = round((finished_at - started_at).total_seconds(), 3)
     save_chat_history(
         chat_id=now_state.chat_id,
         session_address=now_state.session_address,
@@ -447,21 +467,40 @@ async def _run_main(query: str, session_address: str, chat_id: str):
         task_number=len(now_state.task_list),
         seq_number=max(now_state.executor_seq, now_state.supervisor_seq),
         supervisor_descriptions=now_state.supervisor_descriptions.to_dicts(),
+        total_tokens=now_state.total_token,
+        elapsed_time_seconds=elapsed_time_seconds,
+        started_at=started_at.isoformat(timespec="seconds"),
+        finished_at=finished_at.isoformat(timespec="seconds"),
     )
+
+    print(f"""
+    executor任务执行总轮次:{now_state.executor_seq},
+    \nsupervisor任务执行总轮次:{now_state.supervisor_seq},
+    \n任务列表清单：{now_state.task_list}
+    """)
+
     return {
         "status": status,
         "answer": answer,
         "completed_tasks": now_state.now_task_id,
         "task_list": now_state.task_list,
         "block_reason": block_reason,
+        "total_tokens": now_state.total_token,
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "finished_at": finished_at.isoformat(timespec="seconds"),
+        "elapsed_time_seconds": elapsed_time_seconds,
     }
 
 
 async def main(query: str, session_address: str, chat_id: str):
     """Convert startup failures into a saved blocked result."""
+    started_at = datetime.now()
     try:
-        return await _run_main(query, session_address, chat_id)
+        result = await _run_main(query, session_address, chat_id, started_at)
+
     except Exception as exc:
+        finished_at = datetime.now()
+        elapsed_time_seconds = round((finished_at - started_at).total_seconds(), 3)
         answer = f"任务未完成。启动或连接阶段失败：{exc}"
         save_chat_history(
             chat_id=str(chat_id),
@@ -471,14 +510,27 @@ async def main(query: str, session_address: str, chat_id: str):
             description=str(exc),
             task_number=0,
             seq_number=0,
+            total_tokens=0,
+            elapsed_time_seconds=elapsed_time_seconds,
+            started_at=started_at.isoformat(timespec="seconds"),
+            finished_at=finished_at.isoformat(timespec="seconds"),
         )
-        return {
+        result = {
             "status": "blocked",
             "answer": answer,
             "completed_tasks": 0,
             "task_list": [],
             "block_reason": str(exc),
+            "total_tokens": 0,
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "elapsed_time_seconds": elapsed_time_seconds,
         }
+    print(
+        f"Total tokens: {result['total_tokens']}, "
+        f"elapsed time: {result['elapsed_time_seconds']} seconds"
+    )
+    return result
 
 
 async def _register_mcp_clients(host):

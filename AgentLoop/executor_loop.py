@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from AgentLoop.loop_utils import (
     DESCRIPTION_MAX_CHARS,
@@ -31,7 +39,8 @@ EXECUTOR_PROMPT = """
 3. is_finished 只表示本轮委派目标已完成，之后仍必须由 Supervisor 验收。
 4. 信息或证据不足时返回 false，并说明下一步；不要把“没有报错”当作完成证据。
 5. selected_skill 可为空。若选择，必须使用 skills 中真实的 id/name；skill 不授予额外工具权限。
-6. 最终仅返回 JSON：
+6. description 必须是非空字符串，具体记录本步事实、真实证据、产出和未完成项；不得只写“已完成”“成功”等无法验收的结论。
+7. is_finished 必须是 JSON 布尔值 true/false，不能使用字符串。最终仅返回 JSON：
 {
   "tool_name": null,
   "selected_skill": {"skill_name": null, "skill_id": null},
@@ -42,16 +51,51 @@ EXECUTOR_PROMPT = """
 
 
 class SelectedSkill(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     skill_name: str | None = None
     skill_id: int | None = None
 
+    @model_validator(mode="after")
+    def validate_complete_selection(self):
+        if self.skill_name is not None:
+            self.skill_name = self.skill_name.strip()
+        has_name = bool(self.skill_name)
+        has_id = self.skill_id is not None
+        if has_name != has_id:
+            raise ValueError(
+                "skill_name 和 skill_id 必须同时提供或同时为 null"
+            )
+        if self.skill_id is not None and self.skill_id < 0:
+            raise ValueError("skill_id 不能为负数")
+        return self
+
 
 class ExecutorOutPut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     tool_name: str | None = None
     selected_skill: SelectedSkill | None = None
-    description: str = ""
-    is_finished: bool = False
+    description: str = Field(min_length=1)
+    is_finished: bool = Field(strict=True)
 
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("description 不能为空或只包含空白字符")
+        return value
+
+    @field_validator("tool_name")
+    @classmethod
+    def validate_tool_name(cls, value):
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("tool_name 必须是非空字符串或 null")
+        return value
 
 async def run_executor_loop(
     now_state: AgentState,
@@ -70,6 +114,7 @@ async def run_executor_loop(
     steps = 0
     exit_reason = "executor_step_limit"
 
+    print("====================进入executor执行轮======================")
     if skill_lists:
         selected_skill, selection_description = await _select_skill_before_action(
             now_state,
@@ -85,6 +130,7 @@ async def run_executor_loop(
 
     while steps < now_state.max_executor_steps:
         steps += 1
+        print(f"\n\n第{steps}轮")
         now_state.executor_executing_times += 1
         try:
             response = await _call_model(
@@ -105,6 +151,11 @@ async def run_executor_loop(
             )
             if response["status"] != "success":
                 raise RuntimeError(response.get("message") or "executor model request failed")
+            executor_state.model_stage = "action_selection"
+            executor_state.raw_model_response_excerpt = bounded_text(
+                response.get("message"), 4000, keep_tail=True
+            )
+            executor_state.validation_error = ""
 
             tool_calls = normalize_tool_calls(executor, response["tool"])
             if len(tool_calls) > 1:
@@ -116,9 +167,18 @@ async def run_executor_loop(
                 continue
 
             if not tool_calls:
-                output = ExecutorOutPut.model_validate(
-                    parse_json_object(response.get("message"))
-                )
+                try:
+                    output = ExecutorOutPut.model_validate(
+                        parse_json_object(response.get("message"))
+                    )
+                except (ValueError, ValidationError) as exc:
+                    executor_state.validation_error = str(exc)
+                    feedback = _build_validation_feedback(
+                        exc, response.get("message")
+                    )
+                    descriptions.append(feedback)
+                    _remember(executor_state, feedback)
+                    continue
                 loaded_skill = _load_selected_skill(skill_lists, output.selected_skill)
                 if selected_skill is None and loaded_skill is not None and not output.is_finished:
                     selected_skill = loaded_skill
@@ -181,7 +241,9 @@ async def run_executor_loop(
                 executor_client,
                 executor,
                 messages,
+                executor_state,
             )
+
             description = bounded_text(
                 summary.description, DESCRIPTION_MAX_CHARS, keep_tail=True
             )
@@ -197,6 +259,8 @@ async def run_executor_loop(
         except Exception as exc:
             executor_state.is_error = True
             executor_state.error_message = str(exc)
+            if not executor_state.validation_error:
+                executor_state.validation_error = str(exc)
             description = f"Executor 本轮异常：{exc}"
             executor_state.description = description
             descriptions.append(description)
@@ -228,25 +292,46 @@ async def _summarize_tool_once(
     executor_client,
     executor,
     messages,
+    executor_state,
 ):
+    retry_messages = list(messages)
     last_error = None
     for _ in range(2):
+        response = None
         try:
             response = await _call_model(
                 now_state,
                 chat_function,
                 executor_client,
                 executor,
-                messages,
+                retry_messages,
                 [],
             )
+
             if response["status"] != "success":
                 raise RuntimeError(response.get("message") or "tool summary request failed")
+            executor_state.model_stage = "tool_summary"
+            executor_state.raw_model_response_excerpt = bounded_text(
+                response.get("message"), 4000, keep_tail=True
+            )
             return ExecutorOutPut.model_validate(
                 parse_json_object(response.get("message"))
             )
-        except Exception as exc:
+        except (ValueError, ValidationError, RuntimeError) as exc:
             last_error = exc
+            raw_response = "" if response is None else response.get("message")
+            executor_state.model_stage = "tool_summary"
+            executor_state.raw_model_response_excerpt = bounded_text(
+                raw_response, 4000, keep_tail=True
+            )
+            executor_state.validation_error = str(exc)
+            retry_messages = [
+                *retry_messages,
+                {
+                    "role": "user",
+                    "content": _build_validation_feedback(exc, raw_response),
+                },
+            ]
     raise RuntimeError(f"工具已执行，但观察总结失败：{last_error}")
 
 
@@ -300,7 +385,7 @@ async def _call_model(now_state, chat_function, client, provider, messages, tool
     if now_state.model_request_count >= now_state.max_model_requests:
         raise RuntimeError("model request budget exhausted")
     now_state.model_request_count += 1
-    return await call_chat_function(
+    response = await call_chat_function(
         chat_function=chat_function,
         provider=provider,
         client=client,
@@ -309,6 +394,8 @@ async def _call_model(now_state, chat_function, client, provider, messages, tool
         tools=tools,
         temperature=now_state.temperature,
     )
+    now_state.total_token += response.get("total_tokens", 0)
+    return response
 
 
 def _build_executor_messages(
@@ -371,6 +458,10 @@ def _reset_executor_turn(now_state, supervisor_state, executor_state):
     executor_state.memory_window = []
     executor_state.selected_skill = None
     executor_state.exit_reason = ""
+    executor_state.task_attempt = now_state.task_attempt
+    executor_state.model_stage = ""
+    executor_state.raw_model_response_excerpt = ""
+    executor_state.validation_error = ""
 
 
 def _remember(executor_state, description: str):
@@ -379,6 +470,35 @@ def _remember(executor_state, description: str):
             bounded_text(description, DESCRIPTION_MAX_CHARS, keep_tail=True)
         )
         del executor_state.memory_window[:-10]
+
+
+def _build_validation_feedback(exc, raw_response):
+    if isinstance(exc, ValidationError):
+        error_details = exc.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+    else:
+        error_details = str(exc)
+    feedback = {
+        "error_type": type(exc).__name__,
+        "validation_errors": error_details,
+        "raw_response_excerpt": bounded_text(
+            raw_response, 2000, keep_tail=True
+        ),
+        "required_contract": {
+            "tool_name": None,
+            "selected_skill": None,
+            "description": "非空字符串，包含事实、证据、产出和未完成项",
+            "is_finished": False,
+        },
+    }
+    return (
+        "上一条 Executor 响应校验失败。请根据错误修正，"
+        "只返回完整 JSON，不要添加解释、前缀或 Markdown：\n"
+        + json.dumps(feedback, ensure_ascii=False)
+    )
 
 
 def _update_now_state(now_state, executor_state):

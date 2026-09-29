@@ -1,4 +1,8 @@
-from ..Files_function.bfs_read import read_all_files,sort_files_by_suffix,sort_files_by_mother
+from ..Files_function.bfs_read import (
+    read_all_files,
+    read_files_content,
+    sort_files_by_suffix,
+)
 
 from ..Files_function.java_code import (judge_spring_project,
                                         find_java_exe,
@@ -22,20 +26,61 @@ mcp = FastMCP("system")
 @mcp.tool(
     name="read_all_files_tool",
     description="""
-Read file metadata and UTF-8 text content recursively from home_address.
-Returns status and a files list containing file_name, address, mother_file, suffix,
-and content. Undecodable file content is null. For a single file, only metadata
-is returned. Use a specific project directory to limit the amount of data read.
+Browse one level of a project path without reading any file content. Returns a
+compact tree plus directories, files, and pagination summary. Each directory has
+an address that can be passed back to this tool to drill down (for example,
+project/src then project/src/main). Use start_index=summary.next_start_index when
+has_more is true. max_entries must be 1..200. This tool is for structure discovery
+only; use read_files_content_tool for source text. Do not repeatedly call the same
+path and page after a successful result.
     """
 )
-async def read_all_files_tool(home_address:str):
-    return read_all_files(home_address=home_address)
+async def read_all_files_tool(
+        home_address: str,
+        start_index: int = 0,
+        max_entries: int = 200,
+):
+    return read_all_files(
+        home_address=home_address,
+        start_index=start_index,
+        max_entries=max_entries,
+    )
+
+
+@mcp.tool(
+    name="read_files_content_tool",
+    description="""
+Read targeted UTF-8 text after locating it with read_all_files_tool. For a file,
+returns at most max_chars characters (1..20000) beginning at start_char; when
+file.has_more is true, continue with file.next_start_char so no later portion is
+lost. For a directory, reads only its direct files, never descendants, with a
+12000-character total response budget; use start_index/next_start_index to page
+through at most 50 direct files per call, or pass an exact file path for precise
+reading. Sensitive environment files, JSON configured as excluded, and known
+binary/archive formats are not returned. For large pom.xml prefer
+judge_spring_project_tool, which fully parses it into structured Maven data.
+    """
+)
+async def read_files_content_tool(
+        home_address: str,
+        start_char: int = 0,
+        max_chars: int = 12000,
+        start_index: int = 0,
+        max_entries: int = 20,
+):
+    return read_files_content(
+        home_address=home_address,
+        start_char=start_char,
+        max_chars=max_chars,
+        start_index=start_index,
+        max_entries=max_entries,
+    )
 
 
 @mcp.tool(
     name="sort_files_by_suffix_tool",
     description="""
-Group file records by extension, such as .py, .java, or .xml.
+Group file metadata records by extension, such as .py, .java, or .xml.
 Pass the complete successful response from read_all_files_tool as files,
 including status and files. Returns status and a sorted dictionary whose keys
 are extensions and whose values are lists of the original file records.
@@ -46,26 +91,16 @@ async def sort_files_by_suffix_tool(files:dict):
 
 
 @mcp.tool(
-    name="sort_files_by_mother_tool",
-    description="""
-Request grouping of file records by their parent directory (mother_file).
-Pass the complete successful response from read_all_files_tool as files.
-Returns status and a sorted dictionary of file lists. Known implementation
-limitation: the underlying function currently groups by suffix instead of
-mother_file; do not interpret its keys as directory paths.
-    """
-)
-async def sort_files_by_mother_tool(files:dict):
-    return sort_files_by_mother(files)
-
-
-@mcp.tool(
     name="judge_spring_project_tool",
     description="""
 Inspect Maven/Gradle build files and Java/Kotlin imports for Spring and
 Spring Boot evidence. Pass the complete response from sort_files_by_suffix_tool,
 including status and sorted. Returns Spring indicators, build_tools, the declared
-jdk_version, evidence, and warnings. Missing evidence or unresolved Java versions
+jdk_version, evidence, and warnings. Maven POM paths are read and parsed in full
+from the metadata address returned by read_all_files_tool. maven_projects
+contains project/parent coordinates, Maven wrapper and required versions, Java and
+Spring Boot version declarations, modules, profiles, all directly declared and
+managed dependencies, and build plugins. Missing evidence or unresolved versions
 may produce null; this does not prove that Spring is absent. Does not build or run
 the project, resolve external parent POMs, or evaluate dynamic Gradle expressions.
     """

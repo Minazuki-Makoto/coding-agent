@@ -44,6 +44,7 @@ def chatGpt_chat(
         return {
             "status":"success",
             "message":response.choices[0].message.content,
+            "total_tokens": response.usage.total_tokens if response.usage else 0,
             "tool": [
                 call.model_dump()
                 for call in (response.choices[0].message.tool_calls or [])
@@ -56,6 +57,7 @@ def chatGpt_chat(
         return {
             "status":"error",
             "message":str(e),
+            "total_tokens": 0,
             "tool": []
         }
 

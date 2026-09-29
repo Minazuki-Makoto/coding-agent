@@ -9,6 +9,172 @@ import os
 import sys
 
 
+def _xml_text(node, path, default=""):
+    value = node.findtext(path)
+    return value.strip() if isinstance(value, str) else default
+
+
+def _resolve_maven_value(value, properties):
+    if not value:
+        return None
+    result = value.strip()
+    visited = set()
+    while result.startswith("${") and result.endswith("}") and result not in visited:
+        visited.add(result)
+        result = properties.get(result[2:-1], result)
+    return result
+
+
+def _maven_coordinate(node, properties):
+    return {
+        "group_id": _resolve_maven_value(_xml_text(node, "groupId"), properties),
+        "artifact_id": _resolve_maven_value(_xml_text(node, "artifactId"), properties),
+        "version": _resolve_maven_value(_xml_text(node, "version"), properties),
+    }
+
+
+def _read_complete_build_file(file_record, expected_names, warnings):
+    """Read a build file in full; directory-scan content is only a preview."""
+    address = str(file_record.get("address") or file_record.get("file_name") or "")
+    path = Path(address)
+    if path.name not in expected_names or not path.is_file():
+        content = file_record.get("content")
+        if isinstance(content, str):
+            warnings.append(f"{address}: source path unavailable; analyzed scan preview only")
+            return content
+        warnings.append(f"{address}: missing text content")
+        return None
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        warnings.append(f"{address}: build file is not UTF-8 text")
+    except OSError as exc:
+        warnings.append(f"{address}: cannot read complete build file: {type(exc).__name__}")
+    return None
+
+
+def _parse_maven_project(root, address):
+    # ElementTree does not fetch external parent POMs. Only the complete local POM
+    # is parsed, so a large dependency section is not lost to scan-preview limits.
+    for node in root.iter():
+        node.tag = node.tag.rsplit("}", 1)[-1]
+
+    properties = {
+        node.tag: (node.text or "").strip()
+        for node in root.findall("./properties/*")
+    }
+    parent_node = root.find("./parent")
+    parent = _maven_coordinate(parent_node, properties) if parent_node is not None else None
+    project_group = _resolve_maven_value(_xml_text(root, "groupId"), properties)
+    project_version = _resolve_maven_value(_xml_text(root, "version"), properties)
+    project = {
+        "group_id": project_group or (parent or {}).get("group_id"),
+        "artifact_id": _resolve_maven_value(_xml_text(root, "artifactId"), properties),
+        "version": project_version or (parent or {}).get("version"),
+        "packaging": _xml_text(root, "packaging", "jar"),
+    }
+
+    dependencies = []
+    for dependency in root.findall("./dependencies/dependency"):
+        item = _maven_coordinate(dependency, properties)
+        item.update({
+            "scope": _resolve_maven_value(_xml_text(dependency, "scope"), properties) or "compile",
+            "optional": _xml_text(dependency, "optional", "false").lower() == "true",
+        })
+        dependencies.append(item)
+
+    managed_dependencies = [
+        _maven_coordinate(node, properties)
+        for node in root.findall("./dependencyManagement/dependencies/dependency")
+    ]
+    plugins = [
+        _maven_coordinate(node, properties)
+        for node in root.findall("./build/plugins/plugin")
+    ]
+    plugin_management = [
+        _maven_coordinate(node, properties)
+        for node in root.findall("./build/pluginManagement/plugins/plugin")
+    ]
+
+    java_declarations = {}
+    for key in (
+        "java.version", "maven.compiler.release", "maven.compiler.target",
+        "maven.compiler.source",
+    ):
+        if properties.get(key):
+            java_declarations[key] = _resolve_maven_value(properties[key], properties)
+    for plugin in root.findall("./build/plugins/plugin"):
+        if _xml_text(plugin, "artifactId") == "maven-compiler-plugin":
+            for key in ("release", "target", "source"):
+                value = _xml_text(plugin, f"./configuration/{key}")
+                if value:
+                    java_declarations[f"maven-compiler-plugin.{key}"] = _resolve_maven_value(
+                        value, properties
+                    )
+
+    spring_boot_versions = []
+    candidates = []
+    if parent:
+        candidates.append(("parent", parent))
+    candidates.extend(("dependency", item) for item in dependencies + managed_dependencies)
+    candidates.extend(("plugin", item) for item in plugins + plugin_management)
+    for source, item in candidates:
+        if item.get("group_id") == "org.springframework.boot" and item.get("version"):
+            spring_boot_versions.append({"source": source, "version": item["version"]})
+    for key in ("spring-boot.version", "spring.boot.version"):
+        if properties.get(key):
+            spring_boot_versions.append({
+                "source": f"property:{key}",
+                "version": _resolve_maven_value(properties[key], properties),
+            })
+
+    required_maven = _xml_text(root, "./prerequisites/maven") or None
+    for plugin in root.findall("./build/plugins/plugin"):
+        if _xml_text(plugin, "artifactId") != "maven-enforcer-plugin":
+            continue
+        value = plugin.findtext(".//requireMavenVersion/version")
+        if value:
+            required_maven = _resolve_maven_value(value.strip(), properties)
+            break
+
+    wrapper_version = None
+    wrapper_file = Path(address).parent / ".mvn" / "wrapper" / "maven-wrapper.properties"
+    if wrapper_file.is_file():
+        try:
+            wrapper_text = wrapper_file.read_text(encoding="utf-8-sig")
+            match = re.search(r"apache-maven-([\w.-]+?)-bin\.zip", wrapper_text)
+            wrapper_version = match.group(1) if match else None
+        except (OSError, UnicodeDecodeError):
+            pass
+
+    return {
+        "pom_path": address,
+        "model_version": _xml_text(root, "modelVersion") or None,
+        "project": project,
+        "parent": parent,
+        "maven": {
+            "wrapper_version": wrapper_version,
+            "required_version": required_maven,
+        },
+        "java_declarations": java_declarations,
+        "spring_boot_versions": spring_boot_versions,
+        "modules": [
+            (node.text or "").strip() for node in root.findall("./modules/module")
+            if (node.text or "").strip()
+        ],
+        "profiles": [
+            _xml_text(node, "id") for node in root.findall("./profiles/profile")
+            if _xml_text(node, "id")
+        ],
+        "dependency_count": len(dependencies),
+        "declared_dependencies": dependencies,
+        "managed_dependency_count": len(managed_dependencies),
+        "managed_dependencies": managed_dependencies,
+        "plugins": plugins,
+        "plugin_management": plugin_management,
+    }
+
+
 # 根据一个项目的通过read_all_files()和sort_files_by_suffix()得到的结果来判断是不是spring/spring boot
 def judge_spring_project(
         sorted_files: dict
@@ -29,6 +195,7 @@ def judge_spring_project(
     unresolved_jdk = False
     is_spring = False
     is_spring_boot = False
+    maven_projects = []
 
     # 保留字符串字面量，去掉行注释和块注释，避免注释中的示例触发判断。
     def remove_comments(content):
@@ -51,9 +218,17 @@ def judge_spring_project(
             if tool and tool not in build_tools:
                 build_tools.append(tool)
             address = str(file.get("address") or name)
-            content = file.get("content")
+            if is_maven:
+                content = _read_complete_build_file(file, {"pom.xml"}, warnings)
+            elif is_gradle:
+                content = _read_complete_build_file(
+                    file, {"build.gradle", "build.gradle.kts"}, warnings
+                )
+            else:
+                content = file.get("content")
             if not isinstance(content, str):
-                warnings.append(f"{address}: missing text content")
+                if not (is_maven or is_gradle):
+                    warnings.append(f"{address}: missing text content")
                 continue
 
             matches = []
@@ -64,9 +239,9 @@ def judge_spring_project(
                 except ET.ParseError:
                     warnings.append(f"{address}: invalid Maven XML")
                     continue
+                maven_project = _parse_maven_project(root, address)
+                maven_projects.append(maven_project)
                 # 去掉 XML 命名空间，按节点读取，不依赖缩进或换行。
-                for node in root.iter():
-                    node.tag = node.tag.rsplit("}", 1)[-1]
                 properties = {node.tag: (node.text or "").strip()
                               for node in root.findall("./properties/*")}
                 for key in ("java.version", "maven.compiler.release",
@@ -145,6 +320,7 @@ def judge_spring_project(
         "is_spring_boot_project": True if is_spring_boot else None,
         "build_tools": build_tools,
         "jdk_version": jdk_version,
+        "maven_projects": maven_projects,
         "evidence": evidence,
         "warnings": warnings
     }

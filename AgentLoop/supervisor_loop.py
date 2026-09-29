@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from AgentLoop.loop_utils import (
     DESCRIPTION_MAX_CHARS,
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PLAN_SKILL_PATH = PROJECT_ROOT / "Skills" / "supervisor_plan.md"
+DECISION_SKILL_PATH = PROJECT_ROOT / "Skills" / "supervisor_decison.md"
 
 SUPERVISOR_EVALUATION_PROMPT = """
 你是 Supervisor 的 evaluation 阶段，只验收上一轮 Executor 的委派目标，不推进 task。
@@ -89,12 +90,15 @@ class PlanningResult(BaseModel):
 
 
 class InitialGuidance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     description: str = ""
     executor_guidance: str
     completion_criteria: str
 
 
 class NeededCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     session_address: str | None = None
     chat_id: str | None = None
     task_id: int | None = None
@@ -102,11 +106,15 @@ class NeededCheck(BaseModel):
 
 
 class SupervisorSkill(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     skill_id: int | None = None
     skill_name: str | None = None
 
 
 class SupervisorEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     is_passed: bool = False
     description: str = ""
     is_error: bool = False
@@ -124,9 +132,11 @@ class DateBack(BaseModel):
 
 
 class SupervisorDecisionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     is_task_list_need_change: bool = False
     new_task_list: list[str] = Field(default_factory=list)
-    is_next_target: bool = False
+    is_next_target: bool
     next_executor_target: str = ""
     need_date_back: bool = False
     description: str = ""
@@ -155,6 +165,7 @@ async def supervisor_making_plan(
     skill_lists: list[Skill] | None = None,
 ):
     supervisor_state.memory_window = []
+
     information = {
         "user_query": bounded_text(query, USER_QUERY_MAX_CHARS),
         "session_address": now_state.session_address,
@@ -162,16 +173,20 @@ async def supervisor_making_plan(
         "executor_tools": _tool_catalog(executor_tools or []),
         "skill_info": _skill_catalog(skill_lists or []),
     }
-    prompt = _load_planning_skill()
 
-    for _ in range(now_state.max_supervision_times):
+    prompt = _load_planning_skill()
+    print("==================开启supervisor指定计划轮=====================")
+    for i in range(now_state.max_supervision_times):
+        print(f"\n\n第{i + 1}轮")
         messages = build_model_messages(supervisor, prompt, information)
         response = await _call_supervisor_model(
             now_state, chat_function, client, supervisor, messages, supervisor_tools
         )
+
         if response["status"] != "success":
             supervisor_state.exit_reason = "planning_model_error"
             raise RuntimeError(response.get("message") or "planning model request failed")
+        _record_supervisor_model_response(supervisor_state, "planning", response)
         calls = normalize_tool_calls(supervisor, response["tool"])
         if len(calls) > 1:
             information["last_feedback"] = (
@@ -214,6 +229,9 @@ async def supervisor_making_plan(
             information["last_feedback"] = "历史工具已执行，但规划总结失败；不要重复调用。"
             information["latest_tool_observation"] = tool_result.to_dict()
             continue
+        _record_supervisor_model_response(
+            supervisor_state, "planning_summary", summary
+        )
         result = PlanningResult.model_validate(
             parse_json_object(summary.get("message"))
         )
@@ -291,7 +309,10 @@ async def evaluation_loop(
     executor_state: ExecutorState,
 ):
     selected_skill = None
-    for _ in range(now_state.max_supervision_times):
+
+    print("================进入supervisor_evaluation阶段=================")
+    for i in range(now_state.max_supervision_times):
+        print(f"\n\n第{i+1}轮")
         messages = _build_supervisor_evaluation_message(
             executor_state,
             now_state,
@@ -313,6 +334,7 @@ async def evaluation_loop(
                 response.get("message") or "evaluation model request failed"
             )
             break
+        _record_supervisor_model_response(supervisor_state, "evaluation", response)
         calls = normalize_tool_calls(supervisor, response["tool"])
         if len(calls) > 1:
             _evaluation_memory(
@@ -357,6 +379,9 @@ async def evaluation_loop(
                     "检查工具已执行，但总结失败；保留观察且不重复执行。",
                 )
                 continue
+            _record_supervisor_model_response(
+                supervisor_state, "evaluation_summary", summary
+            )
             result = SupervisorEvaluation.model_validate(
                 parse_json_object(summary.get("message"))
             )
@@ -398,7 +423,11 @@ async def making_next_plan_loop(
     supervisor_evaluation_state: SupervisorEvaluationState,
     executor_state: ExecutorState,
 ):
-    for _ in range(now_state.max_supervision_times):
+
+    print("===============进入supervisor_making_decision阶段======================")
+    for i in range(now_state.max_supervision_times):
+
+        print(f"\n\n第{i+1}轮")
         messages = _build_decision_message(
             now_state,
             supervisor_state,
@@ -414,11 +443,13 @@ async def making_next_plan_loop(
             messages,
             supervisor_tools,
         )
+
         if response["status"] != "success":
             supervisor_state.exit_reason = (
                 response.get("message") or "decision model request failed"
             )
             break
+        _record_supervisor_model_response(supervisor_state, "decision", response)
         calls = normalize_tool_calls(supervisor, response["tool"])
         if len(calls) > 1:
             supervisor_state.memory_window.append(
@@ -426,9 +457,7 @@ async def making_next_plan_loop(
             )
             continue
         if not calls:
-            result = SupervisorDecisionResult.model_validate(
-                parse_json_object(response.get("message"))
-            )
+            decision_response = response
         else:
             call = calls[0]
             tool_result = await tool_registry.call(
@@ -460,9 +489,31 @@ async def making_next_plan_loop(
                     "决策查询工具已执行，但总结失败；不重复工具。"
                 )
                 continue
-            result = SupervisorDecisionResult.model_validate(
-                parse_json_object(summary.get("message"))
+            decision_response = summary
+            _record_supervisor_model_response(
+                supervisor_state, "decision_summary", summary
             )
+
+        try:
+            result = SupervisorDecisionResult.model_validate(
+                parse_json_object(decision_response.get("message"))
+            )
+        except (ValueError, ValidationError) as exc:
+            supervisor_state.validation_error = str(exc)
+            feedback = (
+                "decision JSON 校验失败，未应用任务推进："
+                f"{bounded_text(exc, 1200)}。"
+                "下一次必须返回完整 JSON，尤其必须包含 is_next_target。"
+            )
+            supervisor_state.memory_window.append(feedback)
+            del supervisor_state.memory_window[:-10]
+            _save_supervisor_turn(
+                now_state,
+                supervisor_state,
+                "decision_validation_error",
+                feedback,
+            )
+            continue
 
         _validate_decision_plan(now_state, result)
         _apply_decision(supervisor_state, result)
@@ -599,7 +650,7 @@ def _build_decision_message(
         "executor_error_message": supervisor_evaluation_state.executor_error_message,
         "memory_window": list(supervisor_state.memory_window)[-10:],
     }
-    return build_model_messages(supervisor, SUPERVISOR_DECISION_PROMPT, information)
+    return build_model_messages(supervisor, _load_decision_prompt(), information)
 
 
 async def _call_supervisor_model(
@@ -608,7 +659,7 @@ async def _call_supervisor_model(
     if now_state.model_request_count >= now_state.max_model_requests:
         return {"status": "error", "message": "model request budget exhausted", "tool": []}
     now_state.model_request_count += 1
-    return await call_chat_function(
+    response = await call_chat_function(
         chat_function,
         provider,
         client,
@@ -617,6 +668,8 @@ async def _call_supervisor_model(
         tools,
         now_state.temperature,
     )
+    now_state.total_token += response.get("total_tokens", 0)
+    return response
 
 
 async def _prepare_initial_guidance(
@@ -729,6 +782,10 @@ def _reset_supervisor_turn(now_state, supervisor_state, evaluation_state):
     supervisor_state.reviewed_executor_seqs = []
     supervisor_state.decision_finished = False
     supervisor_state.exit_reason = ""
+    supervisor_state.task_attempt = now_state.task_attempt
+    supervisor_state.model_stage = ""
+    supervisor_state.raw_model_response_excerpt = ""
+    supervisor_state.validation_error = ""
     evaluation_state.supervisor_seq = now_state.supervisor_seq
     evaluation_state.chat_id = now_state.chat_id
     evaluation_state.task_id = now_state.now_task_id
@@ -745,6 +802,14 @@ def _reset_supervisor_turn(now_state, supervisor_state, evaluation_state):
     evaluation_state.tool_result = None
     evaluation_state.is_finished = False
     evaluation_state.blocked = False
+
+
+def _record_supervisor_model_response(supervisor_state, stage, response):
+    supervisor_state.model_stage = stage
+    supervisor_state.raw_model_response_excerpt = bounded_text(
+        response.get("message"), 4000, keep_tail=True
+    )
+    supervisor_state.validation_error = ""
 
 
 def _next_supervisor_seq(now_state, supervisor_state):
@@ -814,6 +879,13 @@ def _load_planning_skill():
 
 def _load_planning_prompt():
     return _load_planning_skill()
+
+
+def _load_decision_prompt():
+    try:
+        return DECISION_SKILL_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return SUPERVISOR_DECISION_PROMPT
 
 
 def _tool_catalog(tools):
