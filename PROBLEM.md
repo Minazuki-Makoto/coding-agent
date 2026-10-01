@@ -94,6 +94,14 @@ task 证据层：有界 evidence_context，保存可验收事实和 locator
 对话层：description，只负责说明和语义检索
 ```
 
+原始事实层采用独立的 `tool_results.jsonl`：每次普通工具调用只在该文件
+保存一次完整参数和规范化结果，并由独立 `tool_result_seq` 标识。
+`executor_history.jsonl` 与 `supervisor_history.jsonl` 只保存
+`ToolResultLocator`、`ToolSummary`、状态和控制字段。历史查询工具返回的是
+既有历史视图，其返回正文不得再次写入 `tool_results.jsonl`，避免查询历史时
+递归复制旧事实。旧会话中内联的 `tool_result` 仍保持只读兼容；新记录不再
+写入旧内联格式。
+
 ### 3.1 建议新增 TaskEvidence
 
 建议在 AgentState 中增加按 task_id 管理的证据状态，示意结构：

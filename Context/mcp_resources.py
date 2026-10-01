@@ -12,6 +12,7 @@ from Context.History_Resorce.mcp_history_error import (
 read_question_task,
 read_history_by_seq
 )
+from State.save_tool_result import read_tool_result_record
 
 
 # 从项目根目录运行：python -m Context.mcp_resources
@@ -20,7 +21,11 @@ mcp_server = FastMCP("history tools")
 @mcp_server.tool(
     name="read_now_task",
     description=(
-        'Use when starting or resuming a task, or when you need description-only semantic matching over that task\'s saved context. session_address is the existing session directory containing the history files, not a file path or URI; pass it unchanged without URL encoding. chat_id selects the chat within that directory. Use the session_address and chat_id supplied by the host or task context; do not invent them. task_id selects exactly that task. Returns a JSON array of candidates. Each candidate contains only a description for relevance judgment and a locator object with session_address, chat_id, task_id and seq. Judge relevance only from description; locator is opaque routing metadata and must not influence relevance. To inspect a selected candidate, pass its locator fields unchanged to read_task_error. Summaries omit full tool inputs and outputs. Ordinary failed attempts are omitted; use read_task_history_error for unresolved problems. An empty list means no matching summaries or notices, not proof that the task is complete.'
+        "读取指定 task_id 内已经保存的有效执行摘要与 locator。仅当当前 handoff、"
+        "recent_descriptions 或 latest_tool_context 不足以回答当前缺口时使用，勿在每轮开头"
+        "例行调用。根据 description 判断相关性；需要原始细节时，把 locator 中的 task_id 和 "
+        "seq 原样交给 read_task_error。普通失败不会出现在这里，未解决问题请用 "
+        "read_task_history_error。空数组只表示没有可返回记录，不代表任务已经完成。"
     )
 )
 async def read_now_task(
@@ -38,7 +43,10 @@ async def read_now_task(
 @mcp_server.tool(
     name="read_history_task",
     description=(
-        'Use when the current task depends on earlier tasks or you need previous decisions and results from the same chat. session_address is the existing session directory containing the history files, not a file path or URI; pass it unchanged without URL encoding. chat_id selects the chat within that directory. Use the session_address and chat_id supplied by the host or task context; do not invent them. Pass the CURRENT task_id: this returns only records whose task_id is strictly smaller, excluding the current task and later tasks. Returns valid successful summaries and unresolved invalidation notices, without full tool inputs and outputs or ordinary failed attempts. Validity accounts for repair and invalidation links throughout the chat, including later tasks. For one specific task use read_now_task; for a referenced execution use read_task_error with its task_id and seq.'
+        "读取同一 chat 中早于当前 task_id 的有效任务记录。优先使用 handoff 中已经提供的 "
+        "dependency_context；只有缺少某个前序结论、locator 或修复状态时才调用本工具，避免"
+        "重新查询已经验收的内容。传入当前 task_id，返回范围严格小于它。指定当前任务用 "
+        "read_now_task；已知 task_id 与 seq 并需要原始记录时用 read_task_error。"
     )
 )
 async def read_history_task(
@@ -55,7 +63,9 @@ async def read_history_task(
 @mcp_server.tool(
     name = "read_history_chat",
     description=(
-        "Use only when the current input lacks necessary user constraints or prior decisions. session_address is the known session directory containing chat_history.jsonl; pass it unchanged. Optionally pass the host-provided chat_id to filter records and preserve leading zeroes. It does not read executor history. When the current input is sufficient, skip this tool."
+        "仅在当前输入与 handoff 缺少必要的用户约束、范围或历史决策时读取聊天记录。"
+        "它不读取 Executor 执行历史；当前上下文足够时不要调用。chat_id 必须使用 Host "
+        "提供的原值，不要自行构造或转换。"
     )
 )
 async def read_history_chat(
@@ -70,7 +80,10 @@ async def read_history_chat(
 @mcp_server.tool(
     name = "read_task_history_error",
     description=(
-        'Use to investigate what still needs fixing for a specific task. session_address is the existing session directory containing the history files, not a file path or URI; pass it unchanged without URL encoding. chat_id selects the chat within that directory. Use the session_address and chat_id supplied by the host or task context; do not invent them. task_id selects exactly that task. Returns currently unresolved failed attempts and invalidated execution records, excluding problems with a valid repair. Includes stored execution details, a summary, and available supervisor advice; invalidated records also identify the invalidating execution. A record may retain is_solved=true from its original execution and still be unresolved because it was later invalidated. An empty list means no pending problems were reconstructed from the saved history; this tool does not test the current code or prove it is correct.'
+        "读取指定任务中当前仍未解决的失败或被失效记录。仅在 handoff 指出历史错误、修复链"
+        "不清楚，或当前证据与历史结论冲突时使用；不要把它当成常规上下文加载工具。"
+        "已被有效修复的问题会被排除。空数组表示历史中未重建出待解决问题，不等于当前代码"
+        "已经通过验证。"
     )
 )
 async def read_task_history_error(
@@ -87,7 +100,10 @@ async def read_task_history_error(
 @mcp_server.tool(
     name = "read_task_error",
     description=(
-        "Use when task_id and seq are already known and you need the stored details of that exact execution, for example to inspect inputs, outputs or a historical decision. session_address is the existing session directory containing the history files, not a file path or URI; pass it unchanged without URL encoding. chat_id selects the chat within that directory. Use the session_address and chat_id supplied by the host or task context; do not invent them. task_id and seq together identify the execution within the chat. Returns matching original execution data and its saved supervisor summary, regardless of whether the execution originally succeeded, failed, was later invalidated or repaired. It does not reconstruct the record's current validity or attach later correction advice; use read_task_history_error for currently unresolved problems. An empty list means no matching record. Despite its name, it can retrieve successful executions as well as errors."
+        "按已知 task_id 与 seq 精确读取一条 Executor 历史记录，可用于补取其输入、输出或"
+        "保存的 Supervisor 结论。不要用它做模糊搜索，也不要在已有摘要足够时回读原文。"
+        "它可返回成功或失败记录，但不计算记录当前是否仍有效；未解决问题请用 "
+        "read_task_history_error。"
     )
 )
 async def read_task_error(
@@ -101,6 +117,26 @@ async def read_task_error(
         chat_id=chat_id,
         task_id=task_id,
         seq=seq
+    )
+
+
+@mcp_server.tool(
+    name="read_tool_result",
+    description=(
+        "按 tool_result_seq 精确读取一条原始工具结果。仅当 latest_tool_context 或摘要缺少"
+        "完成当前判断所必需的原始字段时调用；已有 description 和结构化元数据足够时不要"
+        "回读。session_address 与 chat_id 由 Host 绑定，模型只选择 tool_result_seq。"
+    ),
+)
+async def read_tool_result(
+    session_address: str,
+    chat_id: str,
+    tool_result_seq: int,
+):
+    return read_tool_result_record(
+        session_address=session_address,
+        chat_id=chat_id,
+        tool_result_seq=tool_result_seq,
     )
 
 def register_memory_tools():

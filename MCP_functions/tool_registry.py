@@ -63,6 +63,7 @@ SUPERVISOR_ONLY_TOOLS = {
     "read_task_error",
     "read_supervisor_task",
     "read_supervisor_history",
+    "read_tool_result",
 }
 
 SHARED_READ_ONLY_TOOLS = {
@@ -78,6 +79,7 @@ EXECUTOR_ONLY_TOOLS = {
     "package_spring_boot_with_confirmation_tool",
     "check_spring_boot_startup_tool",
     "write_in_tool",
+    "str_replace_tool",
     "find_the_python_editor_tool",
     "run_code_get_feedback_tool",
     "download_package_with_confirmation_tool",
@@ -108,10 +110,12 @@ class ToolRegistry:
             self,
             host,
             permissions:dict[str,set[AgentRole]] | None = None,
-            client_default_permissions:dict[str,set[AgentRole]] | None = None
+            client_default_permissions:dict[str,set[AgentRole]] | None = None,
+            context_provider=None,
     ):
         self.host = host
         self.permissions = permissions or build_default_tool_permissions()
+        self.context_provider = context_provider
 
         # 外部 MCP 的工具名称是动态发现的，按服务分配给 executor。
         self.client_default_permissions = client_default_permissions or {
@@ -219,6 +223,18 @@ class ToolRegistry:
                 message="tool arguments must be a dictionary"
             )
 
+        if tool_name in SUPERVISOR_ONLY_TOOLS:
+            try:
+                bound_arguments = self._bind_history_arguments(tool_name, arguments)
+                arguments.clear()
+                arguments.update(bound_arguments)
+            except ValueError as exc:
+                return self._error(
+                    tool_name=tool_name,
+                    error_type="invalid_history_arguments",
+                    message=str(exc),
+                )
+
         client_name = self.host.tool_dictionary.get(tool_name)
         if client_name is None:
             return self._error(
@@ -263,6 +279,37 @@ class ToolRegistry:
             client_name=client_name,
             raw_result=raw_result
         )
+
+    def _bind_history_arguments(self, tool_name, arguments):
+        if not callable(self.context_provider):
+            raise ValueError("host history context is not configured")
+        context = self.context_provider() or {}
+        session_address = context.get("session_address")
+        chat_id = context.get("chat_id")
+        current_task_id = context.get("task_id")
+        if not isinstance(session_address, str) or not session_address:
+            raise ValueError("host session_address is unavailable")
+        if not isinstance(chat_id, str) or not chat_id:
+            raise ValueError("host chat_id is unavailable")
+        bound = dict(arguments)
+        bound["session_address"] = session_address
+        bound["chat_id"] = chat_id
+        if "task_id" in bound:
+            task_id = bound["task_id"]
+            if type(task_id) is not int or task_id < 0:
+                raise ValueError("task_id must be a non-negative integer")
+            if type(current_task_id) is int and task_id > current_task_id:
+                raise ValueError("task_id cannot refer to a future task")
+        if "seq" in bound and (
+            type(bound["seq"]) is not int or bound["seq"] < 0
+        ):
+            raise ValueError("seq must be a non-negative integer")
+        if "tool_result_seq" in bound and (
+            type(bound["tool_result_seq"]) is not int
+            or bound["tool_result_seq"] < 1
+        ):
+            raise ValueError("tool_result_seq must be a positive integer")
+        return bound
 
     def _normalize_result(self,tool_name,client_name,raw_result):
         payload = self._dump_result(raw_result)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -29,6 +30,11 @@ from MCP_functions.MCP_hosts import mcp_host
 from MCP_functions.Search.mcp_search_server import get_remote_mcp_link
 from MCP_functions.tool_registry import AgentRole, ToolRegistry
 from State.save_chat_history import save_chat_history
+from State.save_tool_result import (
+    ToolResultLocator,
+    ToolSummary,
+    load_last_tool_result_seq,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +63,78 @@ class Checkpoint:
     previous_description: str
     error_advice: str
     verification_requirement: str
+
+
+@dataclass
+class EvidenceReference:
+    tool_result_seq: int
+    tool_name: str
+    root: str | None = None
+    address: str | None = None
+    status: str = ""
+    paths: list[str] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "tool_result_seq": self.tool_result_seq,
+            "tool_name": self.tool_name,
+            "root": self.root,
+            "address": self.address,
+            "status": self.status,
+            "paths": list(self.paths),
+        }
+
+
+@dataclass
+class TaskOutcome:
+    task_id: int
+    target: str
+    accepted_summary: str
+    verification_summary: str
+    evidence_references: list[EvidenceReference] = field(default_factory=list)
+    reusable_read_calls: list[str] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "task_id": self.task_id,
+            "target": self.target,
+            "accepted_summary": self.accepted_summary,
+            "verification_summary": self.verification_summary,
+            "evidence_references": [item.to_dict() for item in self.evidence_references],
+            "reusable_read_calls": list(self.reusable_read_calls),
+        }
+
+
+@dataclass
+class SupervisorHandoff:
+    supervisor_seq: int
+    task_id: int
+    target: str
+    instruction: str
+    previous_work: list[str] = field(default_factory=list)
+    accepted_work: list[str] = field(default_factory=list)
+    remaining_work: list[str] = field(default_factory=list)
+    completion_criteria: str = ""
+    evidence_locators: list[dict[str, int]] = field(default_factory=list)
+    completed_tool_calls: list[str] = field(default_factory=list)
+    dependency_context: list[TaskOutcome] = field(default_factory=list)
+    execution_mode: str = "execute"
+
+    def to_dict(self):
+        return {
+            "supervisor_seq": self.supervisor_seq,
+            "task_id": self.task_id,
+            "target": self.target,
+            "instruction": self.instruction,
+            "previous_work": list(self.previous_work),
+            "accepted_work": list(self.accepted_work),
+            "remaining_work": list(self.remaining_work),
+            "completion_criteria": self.completion_criteria,
+            "evidence_locators": list(self.evidence_locators),
+            "completed_tool_calls": list(self.completed_tool_calls),
+            "dependency_context": [item.to_dict() for item in self.dependency_context],
+            "execution_mode": self.execution_mode,
+        }
 
 
 @dataclass(frozen=True)
@@ -150,7 +228,10 @@ class SupervisorState:
     reviewed_executor_seqs: list[int] = field(default_factory=list)
     tool_name: str = ""
     tool_arguments: dict[str, Any] = field(default_factory=dict)
-    tool_result: Any = None
+    last_tool_result_ref: ToolResultLocator | None = None
+    tool_result_refs: list[ToolResultLocator] = field(default_factory=list)
+    tool_summaries: list[ToolSummary] = field(default_factory=list)
+    referenced_tool_result_seqs: list[int] = field(default_factory=list)
     tool_ok: bool | None = None
     need_date_back: bool = False
     date_back_locations: list[dict[str, Any]] = field(default_factory=list)
@@ -166,6 +247,12 @@ class SupervisorState:
     model_stage: str = ""
     raw_model_response_excerpt: str = ""
     validation_error: str = ""
+    handoff: SupervisorHandoff | None = None
+    original_completion_criteria: str = ""
+    accepted_work: list[str] = field(default_factory=list)
+    remaining_work: list[str] = field(default_factory=list)
+    tool_event_seq: int | None = None
+    evaluation_seq: int | None = None
 
 
 @dataclass
@@ -183,7 +270,9 @@ class SupervisorEvaluationState:
     is_executor_error: bool = False
     executor_error_message: str = ""
     tool_name: str = ""
-    tool_result: Any = None
+    last_tool_result_ref: ToolResultLocator | None = None
+    tool_result_refs: list[ToolResultLocator] = field(default_factory=list)
+    tool_summaries: list[ToolSummary] = field(default_factory=list)
     is_finished: bool = False
     blocked: bool = False
 
@@ -194,7 +283,10 @@ class ExecutorState:
     chat_id: str = ""
     task_id: int = 0
     session_address: str = ""
-    passed_seq_list: list[int] = field(default_factory=list)
+    tool_event_seqs: list[int] = field(default_factory=list)
+    executor_turn_seq: int | None = None
+    tool_summaries: list[ToolSummary] = field(default_factory=list)
+    completed_tool_calls: list[str] = field(default_factory=list)
     now_target: str = ""
     supervisor_guidance: str = ""
     input_content: Any = ""
@@ -202,7 +294,8 @@ class ExecutorState:
     tool_arguments: dict[str, Any] = field(default_factory=dict)
     output_content: str = ""
     description: str = ""
-    tool_result: Any = None
+    last_tool_result_ref: ToolResultLocator | None = None
+    tool_result_refs: list[ToolResultLocator] = field(default_factory=list)
     tool_ok: bool | None = None
     is_finished: bool = False
     is_error: bool = False
@@ -214,6 +307,21 @@ class ExecutorState:
     model_stage: str = ""
     raw_model_response_excerpt: str = ""
     validation_error: str = ""
+    latest_tool_context: LatestToolContext | None = None
+
+
+@dataclass
+class LatestToolContext:
+    tool_name: str = ""
+    tool_ok: bool | None = None
+    tool_result_seq: int | None = None
+    root: str | None = None
+    address: str | None = None
+    paths: list[str] = field(default_factory=list)
+    status: str = ""
+    message: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    pagination: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -247,6 +355,19 @@ class AgentState:
         default_factory=SupervisorDescriptionHistory
     )
     total_token: int = 0
+    tool_result_seq: int = 0
+    task_completion_criteria: dict[int, str] = field(default_factory=dict)
+    task_handoffs: dict[int, SupervisorHandoff] = field(default_factory=dict)
+    task_previous_work: dict[int, list[str]] = field(default_factory=dict)
+    task_accepted_work: dict[int, list[str]] = field(default_factory=dict)
+    task_remaining_work: dict[int, list[str]] = field(default_factory=dict)
+    task_evidence_locators: dict[int, list[dict[str, int]]] = field(default_factory=dict)
+    task_completed_tool_calls: dict[int, list[str]] = field(default_factory=dict)
+    task_evidence_references: dict[int, list[EvidenceReference]] = field(
+        default_factory=dict
+    )
+    task_reusable_read_calls: dict[int, list[str]] = field(default_factory=dict)
+    task_outcomes: dict[int, TaskOutcome] = field(default_factory=dict)
 
 state = AgentState
 
@@ -262,6 +383,7 @@ class RuntimeConfig:
     temperature: float
     java: dict[str, Any] | None
     python: dict[str, Any] | None
+    writable_roots: tuple[str, ...] = ()
 
 
 def load_runtime_config(path: Path = INFORMATION_PATH) -> RuntimeConfig:
@@ -291,6 +413,9 @@ def load_runtime_config(path: Path = INFORMATION_PATH) -> RuntimeConfig:
         temperature=float(infos.get("temperature", 0.3)),
         java=infos.get("java"),
         python=infos.get("python"),
+        writable_roots=tuple(
+            str(item) for item in (infos.get("writable_roots") or []) if item
+        ),
     )
 
 
@@ -316,6 +441,9 @@ async def _run_main(
 ):
     config = load_runtime_config()
     now_state = state_init(session_address, chat_id, query, config)
+    now_state.tool_result_seq = load_last_tool_result_seq(
+        now_state.session_address, now_state.chat_id
+    )
     supervisor_state = SupervisorState(
         session_address=now_state.session_address, chat_id=now_state.chat_id
     )
@@ -332,8 +460,15 @@ async def _run_main(
 
     async with AsyncExitStack() as stack:
         host = mcp_host(stack)
-        await _register_mcp_clients(host)
-        registry = ToolRegistry(host)
+        await _register_mcp_clients(host, config.writable_roots)
+        registry = ToolRegistry(
+            host,
+            context_provider=lambda: {
+                "session_address": now_state.session_address,
+                "chat_id": now_state.chat_id,
+                "task_id": now_state.now_task_id,
+            },
+        )
         supervisor_tools = registry.schemas_for(AgentRole.SUPERVISOR, config.supervisor)
         executor_tools = registry.schemas_for(AgentRole.EXECUTOR, config.executor)
         supervisor_skills = _load_skills(SKILLS_PATH, AgentRole.SUPERVISOR)
@@ -411,6 +546,24 @@ async def _run_main(
                         supervisor_state.executor_plan = (
                             f"执行当前任务并提供可核验证据：{now_state.now_target}"
                         )
+                    criteria = now_state.task_completion_criteria.setdefault(
+                        now_state.now_task_id, now_state.now_target
+                    )
+                    handoff = SupervisorHandoff(
+                        supervisor_seq=now_state.supervisor_seq,
+                        task_id=now_state.now_task_id,
+                        target=now_state.now_target,
+                        instruction=supervisor_state.executor_plan,
+                        completion_criteria=criteria,
+                        dependency_context=[
+                            now_state.task_outcomes[task_id]
+                            for task_id in sorted(now_state.task_outcomes)
+                            if task_id < now_state.now_task_id
+                        ],
+                        execution_mode=decision.next_execution_mode,
+                    )
+                    now_state.task_handoffs[now_state.now_task_id] = handoff
+                    supervisor_state.handoff = handoff
                 elif supervisor_state.exit_reason:
                     block_reason = supervisor_state.exit_reason
                     break
@@ -533,7 +686,7 @@ async def main(query: str, session_address: str, chat_id: str):
     return result
 
 
-async def _register_mcp_clients(host):
+async def _register_mcp_clients(host, writable_roots: tuple[str, ...] = ()):
     required_parameters = {
         "memory": StdioServerParameters(
             command=sys.executable,
@@ -549,6 +702,10 @@ async def _register_mcp_clients(host):
             command=sys.executable,
             args=["-m", "MCP_functions.System_Files.Files_server.mcp_system_server"],
             cwd=str(PROJECT_ROOT),
+            env={
+                **os.environ,
+                "CODING_AGENT_WRITABLE_ROOTS": os.pathsep.join(writable_roots),
+            },
         ),
         "collect": StdioServerParameters(
             command=sys.executable,

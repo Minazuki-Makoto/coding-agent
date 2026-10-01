@@ -71,17 +71,10 @@ def read_supervisor_task_history(
 @mcp_server.tool(
     name="read_supervisor_task",
     description=(
-        "Use when you need the supervisor's saved inspection context for one "
-        "specific task. session_address is the existing session directory "
-        "containing supervisor_history.jsonl, not a file path or URI; pass it "
-        "unchanged. chat_id and task_id select exactly one task. Returns records "
-        "in append order with the saved description, target, tool name, tool "
-        "input and output, error information, and a locator containing "
-        "session_address, chat_id, task_id, executor_seq and supervisor seq. "
-        "The description is returned only when it was actually saved; an empty "
-        "description must not be treated as proof that no inspection occurred. "
-        "Use read_supervisor_history when you need optional executor_seq or seq "
-        "filters across the supervisor history."
+        "读取指定 task_id 已保存的 Supervisor 核查记录。仅当本轮评估输入与 handoff 缺少"
+        "某次核查结论时使用，不要例行回放历史。返回 description、工具输入输出、错误信息"
+        "以及精确 locator；空 description 不代表没有执行过核查。需要按 executor_seq 或 "
+        "Supervisor seq 精确过滤时使用 read_supervisor_history。"
     ),
 )
 async def read_supervisor_task(
@@ -99,15 +92,9 @@ async def read_supervisor_task(
 @mcp_server.tool(
     name="read_supervisor_history",
     description=(
-        "Read the supervisor's saved tool-execution history for one chat. "
-        "Use this to recover what the supervisor previously inspected, including "
-        "tool names, inputs, outputs, errors, task identifiers and sequence numbers. "
-        "Pass the existing session directory and chat_id supplied by the host; "
-        "do not invent them. You may filter with task_id, executor_seq or the "
-        "supervisor's own seq. If no filter is provided, return all matching "
-        "records in append order. "
-        "This reads supervisor_history.jsonl, not executor_history.jsonl, and "
-        "does not decide whether the executor task is correct."
+        "按 task_id、executor_seq 或 Supervisor seq 查询已保存的 Supervisor 工具历史。"
+        "仅为补齐明确缺失或核对矛盾而调用；不要为了增加信心而读取全部记录。它读取的是 "
+        "supervisor_history.jsonl，不是 Executor 历史，也不能单独证明任务正确。"
     ),
 )
 async def read_supervisor_history_tool(

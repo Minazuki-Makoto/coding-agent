@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,10 @@ from MCP_functions.System_Files.Files_function.bfs_read import (
     sort_files_by_suffix,
 )
 from MCP_functions.System_Files.Files_function.java_code import judge_spring_project
+from MCP_functions.System_Files.Files_server.mcp_system_server import (
+    judge_spring_project_tool,
+    sort_files_by_suffix_tool,
+)
 
 
 class JudgeSpringProjectTests(unittest.TestCase):
@@ -75,6 +80,11 @@ class JudgeSpringProjectTests(unittest.TestCase):
             )
             self.assertEqual(project["modules"], ["child"])
             self.assertEqual(project["profiles"], ["production"])
+
+            grouped = asyncio.run(sort_files_by_suffix_tool(str(root)))
+            inspected = asyncio.run(judge_spring_project_tool(str(root)))
+            self.assertIn(".xml", grouped["sorted"])
+            self.assertTrue(inspected["is_spring_boot_project"])
 
 
 if __name__ == "__main__":

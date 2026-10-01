@@ -8,7 +8,8 @@
 2. 若不推进，下一轮 Executor 应执行什么以及如何验证；
 3. 是否需要调整尚未完成的计划后缀；
 4. 是否需要依据历史记录重新指导，但不回滚磁盘、不重放旧工具；
-5. 最后一个 task 完成时形成面向用户的 `final_answer`。
+5. 下一项 task 应继续执行工具还是只综合已验收证据；
+6. 最后一个 task 完成时形成面向用户的 `final_answer`。
 
 decision 不重新执行 Executor 的写入、运行、安装或构建操作，也不得绕过 evaluation 的否决。
 
@@ -29,6 +30,11 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
   "executor_not_pass_reason": "未通过原因",
   "executor_is_error": false,
   "executor_error_message": "Executor 或工具错误",
+  "original_completion_criteria": "当前 task 锁定的完成条件",
+  "executor_tool_locators": ["当前 task 的证据引用"],
+  "accepted_work": ["当前 task 已接受的工作"],
+  "remaining_work": ["当前 task 尚缺工作"],
+  "completed_task_outcomes": ["此前 task 已验收的摘要、验证结论和证据引用"],
   "memory_window": ["本次 decision 中最近的检查摘要或格式纠错反馈"]
 }
 ```
@@ -43,7 +49,8 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 
 - `is_next_target` 必须为 `false`；
 - 不得用 description 宣称当前 task 已完成；
-- `next_executor_target` 必须给出单一、具体、可验证的下一步；
+- `next_executor_target` 必须给出单一、具体、可验证的下一步，只补 evaluation 指出的缺口；
+- 必须保留 accepted_work，不得要求重做已经通过的路径、文件或操作；
 - 应结合失败原因和错误信息说明缺失证据或修复要求；
 - 没有必要调整计划时，`is_task_list_need_change=false`、`new_task_list=[]`。
 
@@ -53,6 +60,7 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 
 - `is_next_target=false`；
 - 在 `next_executor_target` 中给出当前 task 的下一部分；
+- 下一部分必须来自原始 completion_criteria 的未完成部分，不能新增“最好再检查”的要求；
 - description 应明确“本轮成果已接受，但整个 task 尚未完成”。
 
 ### 当前整个 task 已完成
@@ -61,10 +69,17 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 
 - `executor_is_passed=true`；
 - evaluation 提供了足够的真实证据；
-- `now_target` 的整体完成条件已经满足，而不只是某个局部动作完成；
+- `now_target` 的原始 completion_criteria 已满足，而不只是某个局部动作完成；
 - 没有仍会阻止后续任务的未解决错误。
 
 此时 description、`is_next_target` 和 `is_finished` 必须一致。不能只在 description 中写“推进下一任务”却遗漏 `is_next_target`。`is_next_target` 是主循环唯一使用的推进控制字段，自然语言描述不能替代它。
+
+推进下一项时必须设置 `next_execution_mode`：
+
+- 下一项仍需读取、写入、运行或验证新的外部证据时，设置为 `execute`；
+- 下一项只需要综合此前 task 已验收的 `dependency_context` 时，设置为 `synthesize`；
+- 总结、归纳、最终回答类 task 在证据已经充分时必须使用 `synthesize`，不得重新读取相同文件。
+- `completed_task_outcomes` 已包含的事实不需要再次取证；下一项 handoff 会自动把它们放入 dependency_context。
 
 ### 最后一个 task 完成
 
@@ -77,11 +92,12 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 
 ### 仍需查询历史
 
-只有确实缺少决定所需的信息时才能调用提供的只读工具，并且每次最多调用一个工具。
+只有现有 evaluation、accepted_work、locator 和 completed_task_outcomes 仍缺少某个明确事实时，才能调用提供的只读工具，并且每次最多调用一个。
 
 - 工具调用消息可以没有最终 JSON；
 - 收到工具结果后再输出完整 decision JSON；
 - 工具已经执行但总结失败时，不要重复调用同一工具；
+- 已有 locator 时精确查询该 locator，不读取整段历史；得到足够信息立即停止；
 - 若还不能形成决定，输出 `is_finished=false`，但其余必填字段仍要完整提供。
 
 ## 计划调整
@@ -117,6 +133,7 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
   "new_task_list": [],
   "is_next_target": false,
   "next_executor_target": "下一轮具体操作与验证要求",
+  "next_execution_mode": "execute",
   "need_date_back": false,
   "description": "与控制字段一致的决策依据",
   "is_finished": true,
@@ -133,5 +150,7 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 - 必须输出 `is_next_target`，不能写成 `is_next_task`、`next_target` 或其他名称；
 - description 说推进时，`is_next_target` 必须为 `true`；
 - description 说继续当前任务时，`is_next_target` 必须为 `false`；
+- `next_execution_mode` 只能是 `execute` 或 `synthesize`；
+- 选择 `synthesize` 时，下一项 Executor 将不会获得工具，只能使用跨 task 交接的已验收证据；
 - `is_finished` 表示本次 decision 是否形成完整决定，不表示 Executor 工具成功；
 - 不确定时不得默认成功，也不得依靠省略字段表达判断。

@@ -43,40 +43,18 @@ def _unsafe_content_reason(path: Path):
 
 
 def _file_metadata(path: Path):
-    reason = _unsafe_content_reason(path)
-    try:
-        size_bytes = path.stat().st_size
-    except OSError:
-        size_bytes = None
     return {
-        "type": "file",
         "file_name": path.name,
         "address": str(path.resolve()),
-        "mother_file": str(path.parent.resolve()),
         "suffix": path.suffix.lower(),
-        "size_bytes": size_bytes,
-        "content_available": reason is None,
-        "content_unavailable_reason": reason,
     }
 
 
 def _directory_metadata(path: Path):
     return {
-        "type": "directory",
         "folder_name": path.name,
         "address": str(path.resolve()),
-        "is_common_generated_directory": path.name.lower() in IGNORED_FOLDER_NAMES,
     }
-
-
-def _tree_text(root: Path, entries):
-    lines = [f"{root.name or str(root)}/"]
-    for index, entry in enumerate(entries):
-        connector = "└── " if index == len(entries) - 1 else "├── "
-        suffix = "/" if entry["type"] == "directory" else ""
-        name = entry.get("folder_name") or entry.get("file_name")
-        lines.append(f"{connector}{name}{suffix}")
-    return "\n".join(lines)
 
 
 def _read_text_preview(path: Path, remaining_chars: int):
@@ -128,7 +106,7 @@ def read_all_files(home_address: str, start_index: int = 0, max_entries: int = 2
     if path.is_file():
         metadata = _file_metadata(path)
         return {
-            "status": "success", "root": str(path.resolve()), "tree": path.name,
+            "status": "success", "root": str(path.resolve()),
             "directories": [], "files": [metadata],
             "summary": {
                 "scope": "single_file_metadata", "total_entries": 1,
@@ -144,7 +122,7 @@ def read_all_files(home_address: str, start_index: int = 0, max_entries: int = 2
         return {"status": "error", "message": f"cannot list directory: {type(exc).__name__}"}
 
     page = children[start_index:start_index + max_entries]
-    entries, directories, files = [], [], []
+    directories, files = [], []
     for item in page:
         try:
             if item.is_dir():
@@ -157,17 +135,17 @@ def read_all_files(home_address: str, start_index: int = 0, max_entries: int = 2
                 continue
         except OSError:
             continue
-        entries.append(record)
 
     next_index = start_index + len(page)
     has_more = next_index < len(children)
     return {
         "status": "success", "root": str(path.resolve()),
-        "tree": _tree_text(path, entries), "directories": directories, "files": files,
+        "directories": directories, "files": files,
         "summary": {
             "scope": "one_directory_level", "total_entries": len(children),
-            "returned_entries": len(entries), "start_index": start_index,
-            "max_entries": max_entries, "has_more": has_more,
+            "returned_entries": len(directories) + len(files),
+            "start_index": start_index,
+            "has_more": has_more,
             "next_start_index": next_index if has_more else None,
         },
     }
@@ -235,7 +213,7 @@ def read_files_content(
     content_budget = min(max_chars, MAX_TOTAL_CONTENT_CHARS)
     for item in page:
         metadata = _file_metadata(item)
-        reason = metadata["content_unavailable_reason"]
+        reason = _unsafe_content_reason(item)
         if reason:
             records.append({
                 **metadata, "content": None, "content_status": reason, "content_chars": 0,
@@ -257,10 +235,10 @@ def read_files_content(
         "scope": "direct_directory_file_contents", "directories": directories,
         "files": records,
         "summary": {
-            "recursive": False, "total_directories": len(directories),
+            "total_directories": len(directories),
             "total_files": len(child_files), "returned_files": len(records),
-            "content_chars": total_chars, "content_budget": content_budget,
-            "start_index": start_index, "max_entries": max_entries, "has_more": has_more,
+            "content_chars": total_chars, "start_index": start_index,
+            "has_more": has_more,
             "next_start_index": next_index if has_more else None,
         },
     }
@@ -279,4 +257,3 @@ def sort_files_by_suffix(files: dict):
         return {"status": "success", "sorted": sorted_files}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
-

@@ -10,7 +10,7 @@ from ..Files_function.java_code import (judge_spring_project,
                                         package_spring_boot_with_confirmation,
                                         check_spring_boot_startup)
 
-from ..Files_function.write_in import write_in
+from ..Files_function.write_in import str_replace, write_in
 
 from ..Files_function.python_code import (find_the_python_editor,
                                           run_code_get_feedback,
@@ -27,10 +27,11 @@ mcp = FastMCP("system")
     name="read_all_files_tool",
     description="""
 Browse one level of a project path without reading any file content. Returns a
-compact tree plus directories, files, and pagination summary. Each directory has
+compact directories/files list and pagination summary. Each directory has
 an address that can be passed back to this tool to drill down (for example,
 project/src then project/src/main). Use start_index=summary.next_start_index when
-has_more is true. max_entries must be 1..200. This tool is for structure discovery
+has_more is true. Page size is fixed by the Host at 50 entries so the complete
+result can be summarized without arbitrary JSON truncation. This tool is for structure discovery
 only; use read_files_content_tool for source text. Do not repeatedly call the same
 path and page after a successful result.
     """
@@ -38,12 +39,11 @@ path and page after a successful result.
 async def read_all_files_tool(
         home_address: str,
         start_index: int = 0,
-        max_entries: int = 200,
 ):
     return read_all_files(
         home_address=home_address,
         start_index=start_index,
-        max_entries=max_entries,
+        max_entries=50,
     )
 
 
@@ -51,11 +51,11 @@ async def read_all_files_tool(
     name="read_files_content_tool",
     description="""
 Read targeted UTF-8 text after locating it with read_all_files_tool. For a file,
-returns at most max_chars characters (1..20000) beginning at start_char; when
+returns one Host-bounded page beginning at start_char; when
 file.has_more is true, continue with file.next_start_char so no later portion is
 lost. For a directory, reads only its direct files, never descendants, with a
-12000-character total response budget; use start_index/next_start_index to page
-through at most 50 direct files per call, or pass an exact file path for precise
+8000-character total response budget; use start_index/next_start_index to page
+through direct files, or pass an exact file path for precise
 reading. Sensitive environment files, JSON configured as excluded, and known
 binary/archive formats are not returned. For large pom.xml prefer
 judge_spring_project_tool, which fully parses it into structured Maven data.
@@ -64,38 +64,39 @@ judge_spring_project_tool, which fully parses it into structured Maven data.
 async def read_files_content_tool(
         home_address: str,
         start_char: int = 0,
-        max_chars: int = 12000,
         start_index: int = 0,
-        max_entries: int = 20,
 ):
     return read_files_content(
         home_address=home_address,
         start_char=start_char,
-        max_chars=max_chars,
+        max_chars=8000,
         start_index=start_index,
-        max_entries=max_entries,
+        max_entries=20,
     )
 
 
 @mcp.tool(
     name="sort_files_by_suffix_tool",
     description="""
-Group file metadata records by extension, such as .py, .java, or .xml.
-Pass the complete successful response from read_all_files_tool as files,
-including status and files. Returns status and a sorted dictionary whose keys
-are extensions and whose values are lists of the original file records.
+Scan one level of home_address and group its file metadata by extension, such as
+.py, .java, or .xml. The Host performs the scan internally; do not copy a prior
+read_all_files_tool response into this call.
     """
 )
-async def sort_files_by_suffix_tool(files:dict):
-    return sort_files_by_suffix(files)
+async def sort_files_by_suffix_tool(home_address: str):
+    scanned = read_all_files(home_address)
+    result = sort_files_by_suffix(scanned)
+    if result.get("status") == "success":
+        result["root"] = scanned.get("root")
+    return result
 
 
 @mcp.tool(
     name="judge_spring_project_tool",
     description="""
 Inspect Maven/Gradle build files and Java/Kotlin imports for Spring and
-Spring Boot evidence. Pass the complete response from sort_files_by_suffix_tool,
-including status and sorted. Returns Spring indicators, build_tools, the declared
+Spring Boot evidence. Pass only the project home_address; the Host scans and
+groups the direct build-file metadata internally. Returns Spring indicators, build_tools, the declared
 jdk_version, evidence, and warnings. Maven POM paths are read and parsed in full
 from the metadata address returned by read_all_files_tool. maven_projects
 contains project/parent coordinates, Maven wrapper and required versions, Java and
@@ -105,8 +106,12 @@ may produce null; this does not prove that Spring is absent. Does not build or r
 the project, resolve external parent POMs, or evaluate dynamic Gradle expressions.
     """
 )
-async def judge_spring_project_tool(sorted_files_by_suffix:dict):
-    return judge_spring_project(sorted_files=sorted_files_by_suffix)
+async def judge_spring_project_tool(home_address: str):
+    scanned = read_all_files(home_address)
+    result = judge_spring_project(sorted_files=sort_files_by_suffix(scanned))
+    if result.get("status") == "success":
+        result["root"] = scanned.get("root")
+    return result
 
 
 @mcp.tool(
@@ -171,12 +176,31 @@ async def check_spring_boot_startup_tool(java_path:str, jar_path:str, timeout:in
 @mcp.tool(
     name="write_in_tool",
     description="""
-Request approval to write UTF-8 text to file_address, creating parent directories
-and replacing any existing file content. code is the complete intended content.
+Atomically overwrite file_address with the complete UTF-8 content in code. The
+Host must configure a trusted writable root; paths outside it are rejected.
     """
 )
 async def write_in_tool(file_address:str, code:str):
     return write_in(file_address,code)
+
+
+@mcp.tool(
+    name="str_replace_tool",
+    description="""
+Precisely replace old_text with new_text in one UTF-8 file. The operation is
+atomic and succeeds only when the match count equals expected_replacements.
+Host-configured writable-root restrictions are always enforced.
+    """
+)
+async def str_replace_tool(
+    file_address: str,
+    old_text: str,
+    new_text: str,
+    expected_replacements: int = 1,
+):
+    return str_replace(
+        file_address, old_text, new_text, expected_replacements
+    )
 
 
 @mcp.tool(

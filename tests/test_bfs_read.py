@@ -34,8 +34,13 @@ class BfsReadTests(unittest.TestCase):
             folders = {item["folder_name"] for item in result["directories"]}
             self.assertEqual(folders, {".idea", "src", "target"})
             self.assertTrue(all("content" not in item for item in result["files"]))
-            self.assertNotIn("Main.java", result["tree"])
-            self.assertIn("src/", result["tree"])
+            self.assertNotIn("tree", result)
+            self.assertEqual(
+                set(result["files"][0]), {"file_name", "address", "suffix"}
+            )
+            self.assertEqual(
+                set(result["directories"][0]), {"folder_name", "address"}
+            )
 
     def test_directory_content_is_non_recursive_and_budgeted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -49,7 +54,6 @@ class BfsReadTests(unittest.TestCase):
                 result = read_files_content(str(root))
 
             self.assertEqual(result["summary"]["content_chars"], 12)
-            self.assertEqual(result["summary"]["content_budget"], 12)
             self.assertEqual(
                 [item["content_status"] for item in result["files"]],
                 ["content_read", "content_truncated"],
