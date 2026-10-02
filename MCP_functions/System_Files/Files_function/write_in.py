@@ -6,7 +6,9 @@ from pathlib import Path
 WRITABLE_ROOTS_ENV = "CODING_AGENT_WRITABLE_ROOTS"
 
 
-def _trusted_roots():
+def _trusted_roots(override=None):
+    if override is not None:
+        return [Path(item).resolve() for item in override]
     raw_roots = os.environ.get(WRITABLE_ROOTS_ENV, "")
     return [
         Path(item).resolve()
@@ -15,10 +17,10 @@ def _trusted_roots():
     ]
 
 
-def _resolve_allowed_path(file_address: str):
+def _resolve_allowed_path(file_address: str, trusted_roots=None):
     if not isinstance(file_address, str) or not file_address.strip():
         raise ValueError("file_address must be a non-empty string")
-    roots = _trusted_roots()
+    roots = _trusted_roots(trusted_roots)
     if not roots:
         raise PermissionError("no trusted writable root is configured by the host")
     target = Path(file_address).resolve(strict=False)
@@ -51,11 +53,11 @@ def _atomic_write(target: Path, content: str):
     return created, True, len(content.encode("utf-8"))
 
 
-def write_in(file_address: str, code: str):
+def write_in(file_address: str, code: str, *, trusted_roots=None):
     try:
         if not isinstance(code, str):
             raise ValueError("code must be a string containing the complete file")
-        target = _resolve_allowed_path(file_address)
+        target = _resolve_allowed_path(file_address, trusted_roots)
         created, changed, bytes_written = _atomic_write(target, code)
         return {
             "status": "success", "operation": "overwrite",

@@ -3,6 +3,19 @@
 Supervisor 在 evaluation 阶段默认加载本技能。它规定查询优先级，但不要求每轮调用历史工具：
 先使用 handoff、dependency_context、本轮结果和 locator，只有存在明确证据缺口时才逐层查询；得到足够信息立即停止。
 
+## decision 的累计任务摘要查询
+
+decision 每轮会收到本轮 Executor output 和 Supervisor evaluation；`historical_auxiliary_summary`
+只提示 task_summary.md 是否存在，默认不附带正文。模型自主决定是否读取：对累计有效成果、
+历史依赖、旧结论修正、剩余工作或推进条件没有特别准确的把握时，先调用
+`read_task_summary(task_id=当前任务编号)`，不要凭最新单轮结果推断多轮成果。
+输入已经充分且无矛盾时可直接决策，不必每轮例行读取。
+
+默认只返回指定 task 最新累计记录；确需前序任务背景时使用 `include_other_tasks=true`
+或指定已知前序 task_id。Host 绑定当前 session_address/chat_id，不允许跨 chat 或查询未来任务。
+已查结果放在本轮 `memory_query_results`，先判断是否解决缺口，足够就停止；原文细节仍缺少时
+再按 tool_result_seq 调用 `read_tool_result`。同一查询不要重复。not_found 或读取失败不代表验收通过。
+
 ## 一、先判断是否需要联系上下文
 
 先检查本轮输入是否足以明确用户目标、当前任务、约束和已确认的决定。

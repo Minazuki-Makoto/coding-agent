@@ -8,6 +8,23 @@ def _value(current_state, name, default=None):
     return getattr(current_state, name, default)
 
 
+def load_last_supervisor_seq(session_address, chat_id):
+    """Continue event numbering when appending to an existing chat."""
+    path = Path(session_address) / "supervisor_history.jsonl"
+    if not path.is_file():
+        return 0
+    maximum = 0
+    with path.open("r", encoding="utf-8") as history_file:
+        for line in history_file:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            seq = record.get("seq")
+            if record.get("chat_id") == str(chat_id) and type(seq) is int:
+                maximum = max(maximum, seq)
+    return maximum
+
+
 def save_supervisor_state_history(current_state, record_type: str = "supervisor_turn"):
     """Append a JSON-serializable supervisor event or turn result."""
     session_address = _value(current_state, "session_address")
@@ -89,6 +106,8 @@ def save_supervisor_state_history(current_state, record_type: str = "supervisor_
         "remaining_work": list(_value(current_state, "remaining_work", []) or []),
         "handoff": _value(current_state, "handoff"),
         "evaluation_seq": _value(current_state, "evaluation_seq"),
+        "task_summary": _value(current_state, "task_summary"),
+        "task_outcome": _value(current_state, "task_outcome"),
         "model_stage": _value(current_state, "model_stage", ""),
         "raw_model_response_excerpt": _value(
             current_state, "raw_model_response_excerpt", ""

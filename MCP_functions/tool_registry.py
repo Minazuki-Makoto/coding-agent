@@ -64,6 +64,7 @@ SUPERVISOR_ONLY_TOOLS = {
     "read_supervisor_task",
     "read_supervisor_history",
     "read_tool_result",
+    "read_task_summary",
 }
 
 SHARED_READ_ONLY_TOOLS = {
@@ -165,15 +166,28 @@ class ToolRegistry:
             if not tool_name or not self._is_allowed(role,tool_name):
                 continue
 
+            parameters = function.get("parameters") or {"type": "object", "properties": {}}
+            if tool_name == "read_task_summary":
+                # These values are injected by the Host, never chosen by the model.
+                parameters = {
+                    **parameters,
+                    "properties": {
+                        name: schema
+                        for name, schema in parameters.get("properties", {}).items()
+                        if name not in {"session_address", "chat_id"}
+                    },
+                    "required": [
+                        name for name in parameters.get("required", [])
+                        if name not in {"session_address", "chat_id"}
+                    ],
+                }
+
             if provider == "claude":
                 tools.append(
                     {
                         "name":tool_name,
                         "description":function.get("description", ""),
-                        "input_schema":function.get(
-                            "parameters",
-                            {"type":"object","properties":{}}
-                        )
+                        "input_schema": parameters,
                     }
                 )
 
@@ -184,10 +198,7 @@ class ToolRegistry:
                         "function":{
                             "name":tool_name,
                             "description":function.get("description", ""),
-                            "parameters":function.get(
-                                "parameters",
-                                {"type":"object","properties":{}}
-                            )
+                            "parameters": parameters,
                         }
                     }
                 )

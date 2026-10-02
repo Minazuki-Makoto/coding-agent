@@ -24,8 +24,25 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
   "task_list": ["完整顺序任务列表"],
   "now_task_id": 0,
   "now_target": "当前 task",
-  "executor_target": "上一轮给 Executor 的具体指导",
-  "supervisor_evaluation_result": "evaluation 的事实与结论",
+  "current_turn_latest_result": {
+    "executor_target": "上一轮给 Executor 的具体指导",
+    "executor_summary": "本轮最新执行总结",
+    "executor_tool_result_locators": ["本轮原始工具结果引用"],
+    "tool_summaries": ["本轮工具摘要"]
+  },
+  "current_turn_supervisor_evaluation": {
+    "description": "本轮 Supervisor 验收结果",
+    "is_passed": false,
+    "reason": "未通过原因"
+  },
+  "historical_auxiliary_summary": {
+    "status": "not_loaded 或 queried；默认不加载正文",
+    "available": true,
+    "tool_name": "read_task_summary",
+    "task_id": 0
+  },
+  "memory_query_results": ["本轮模型主动查询后才提供的历史摘要或证据结果"],
+  "current_task_outcome": "当前 task 已存在的 TaskOutcome 或 null",
   "executor_is_passed": false,
   "executor_not_pass_reason": "未通过原因",
   "executor_is_error": false,
@@ -40,6 +57,15 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 ```
 
 必须以结构化字段为准，不能只根据自然语言中的“已完成”“继续”“推进”等词语修改任务状态。
+
+## 时间与证据优先级
+
+1. `current_turn_latest_result` 和 `current_turn_supervisor_evaluation` 是当前状态的主要依据。
+2. `historical_auxiliary_summary` 默认只有可查询提示；主动读取后的摘要在 `memory_query_results` 中。它们和既有 TaskOutcome 只补充此前已完成工作、依赖、决定和遗留问题。
+3. 过去摘要写着“已完成”不能覆盖本轮失败、回归或新问题；本轮有效证据推翻旧结论时，必须在新摘要中明确修正。
+4. 本轮没有涉及的历史有效成果不会自动失效，应继续保留在累计摘要中。
+5. Executor 最新声称完成但缺少必要验证时，不得仅因其时间较新而通过。
+6. 不得复制全部 JSONL 或原始工具输出；只使用已经提供的有界摘要和必要 locator。
 
 ## 决策规则
 
@@ -74,6 +100,13 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 
 此时 description、`is_next_target` 和 `is_finished` 必须一致。不能只在 description 中写“推进下一任务”却遗漏 `is_next_target`。`is_next_target` 是主循环唯一使用的推进控制字段，自然语言描述不能替代它。
 
+最终通过时还必须生成：
+
+- `accepted_summary`：概括整个 task 多轮执行后最终确认的累计成果，不能只复制最近一次 Executor description；
+- `verification_summary`：说明原始验收条件满足情况、Supervisor 实际检查及结果、必要证据定位。
+
+未最终通过时，这两个字段必须为空，不能把待验证内容写成已完成成果。
+
 推进下一项时必须设置 `next_execution_mode`：
 
 - 下一项仍需读取、写入、运行或验证新的外部证据时，设置为 `execute`；
@@ -92,12 +125,17 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 
 ### 仍需查询历史
 
-只有现有 evaluation、accepted_work、locator 和 completed_task_outcomes 仍缺少某个明确事实时，才能调用提供的只读工具，并且每次最多调用一个。
+模型自主决定是否读取 task_summary.md。先使用本轮最新 Executor output、Supervisor evaluation、原始完成条件和已有 TaskOutcome；对累计有效成果、旧结论是否失效、历史依赖、剩余工作或整个 task 的推进条件没有特别准确的把握时，必须先调用 `read_task_summary`，不要猜测。若这些输入已经充分且无矛盾，可直接决定。
+
+调用 `read_task_summary(task_id=当前任务编号)` 默认只取该 task 的最新累计记录；依赖此前任务且已有 TaskOutcome 不足时，可设置 `include_other_tasks=true`，或者查询已知的前序 task_id。Host 强制绑定 session_address 和 chat_id，模型只选择 task_id 和 include_other_tasks。
+
+每次最多调用一个工具；查询结果会加入 `memory_query_results`，然后重新由模型判断是否足够：
 
 - 工具调用消息可以没有最终 JSON；
-- 收到工具结果后再输出完整 decision JSON；
+- 结果足够时输出完整 decision JSON；若仍有具体缺口，选择下一个任务摘要或按 locator 查询原始工具结果；
 - 工具已经执行但总结失败时，不要重复调用同一工具；
 - 已有 locator 时精确查询该 locator，不读取整段历史；得到足够信息立即停止；
+- not_found、读取失败或被上下文预算省略的内容不能作为任务完成证据；说明缺口并维持必要的验收约束；
 - 若还不能形成决定，输出 `is_finished=false`，但其余必填字段仍要完整提供。
 
 ## 计划调整
@@ -141,7 +179,17 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
   "date_back_input": "",
   "modify_content": "",
   "verification_requirement": "",
-  "final_answer": ""
+  "final_answer": "",
+  "task_summary": {
+    "current_turn_summary": "本轮实际执行、关键结果、完成和验证情况",
+    "cumulative_task_summary": "结合仍有效历史成果后的当前累计任务状态",
+    "current_verification_summary": "本轮检查内容、结果和依据",
+    "corrected_or_invalidated": [],
+    "remaining_work": [],
+    "next_step": "Supervisor 最新决定和下一步",
+    "accepted_summary": "只有最终通过时填写",
+    "verification_summary": "只有最终通过时填写"
+  }
 }
 ```
 
@@ -153,4 +201,7 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 - `next_execution_mode` 只能是 `execute` 或 `synthesize`；
 - 选择 `synthesize` 时，下一项 Executor 将不会获得工具，只能使用跨 task 交接的已验收证据；
 - `is_finished` 表示本次 decision 是否形成完整决定，不表示 Executor 工具成功；
+- 完整 decision 必须包含 `task_summary`；其中每项都是更新后的累计状态，不是操作流水账；
+- description 及 task_summary 中的一般说明字段必须少于 3000 个字符，不复制 tool_result 或完整历史；
+- 正式 TaskOutcome 的 accepted_summary 和 verification_summary 使用消息中的可配置长度上限；超限时根据校验反馈压缩重写，不能依靠截断；
 - 不确定时不得默认成功，也不得依靠省略字段表达判断。

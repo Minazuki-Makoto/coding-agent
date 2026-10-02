@@ -27,6 +27,7 @@ from AgentLoop.executor_loop import (
 from AgentLoop.supervisor_loop import (
     DateBack,
     SupervisorDecisionResult,
+    TaskSummaryDraft,
     _apply_decision,
     _validate_decision_plan,
     _save_supervisor_tool_event,
@@ -53,7 +54,30 @@ def model_response(message=None, tool=None, status="success"):
 
 
 def json_message(**values):
+    if "is_next_target" in values and "task_summary" not in values:
+        values["task_summary"] = task_summary_payload(
+            completed=bool(values["is_next_target"])
+        )
     return json.dumps(values, ensure_ascii=False)
+
+
+def task_summary_payload(completed=False, cumulative="累计有效成果"):
+    return {
+        "current_turn_summary": "本轮完成了当前委派并获得关键结果",
+        "cumulative_task_summary": cumulative,
+        "current_verification_summary": "Supervisor 对照完成条件检查了本轮证据",
+        "corrected_or_invalidated": [],
+        "remaining_work": [] if completed else ["继续当前任务"],
+        "next_step": "推进下一任务" if completed else "继续当前任务",
+        "accepted_summary": "任务累计成果已经确认" if completed else "",
+        "verification_summary": "完成条件与实际证据均已检查通过" if completed else "",
+    }
+
+
+def task_summary_draft(completed=False, cumulative="累计有效成果"):
+    return TaskSummaryDraft.model_validate(
+        task_summary_payload(completed=completed, cumulative=cumulative)
+    )
 
 
 def openai_tool(name="fake_tool", arguments=None, call_id="call-1"):
@@ -882,13 +906,17 @@ class SupervisorLoopTests(unittest.IsolatedAsyncioTestCase):
                 next_execution_mode="synthesize",
                 description="当前 task 已完成",
                 is_finished=True,
+                task_summary=task_summary_draft(
+                    completed=True,
+                    cumulative="已确认 controller、service 和 mapper 的累计成果",
+                ),
             )
 
             _apply_decision(agent, supervisor, evaluation, executor, decision)
 
             outcome = agent.task_outcomes[0]
-            self.assertEqual(outcome.accepted_summary, executor.output_content)
-            self.assertIn("controller", outcome.verification_summary)
+            self.assertEqual(outcome.accepted_summary, "任务累计成果已经确认")
+            self.assertIn("完成条件", outcome.verification_summary)
             self.assertEqual(outcome.evidence_references[0].tool_result_seq, 3)
             self.assertEqual(len(outcome.reusable_read_calls), 1)
 
@@ -1378,6 +1406,7 @@ class SupervisorLoopTests(unittest.IsolatedAsyncioTestCase):
             is_task_list_need_change=True,
             new_task_list=["done", "current revised", "new later"],
             is_next_target=False,
+            description="调整未完成计划后缀",
             date_back_location=[
                 DateBack(
                     seq=2,
@@ -1393,6 +1422,7 @@ class SupervisorLoopTests(unittest.IsolatedAsyncioTestCase):
             is_task_list_need_change=True,
             new_task_list=["rewritten", "current"],
             is_next_target=False,
+            description="非法改写已完成前缀",
         )
         with self.assertRaises(ValueError):
             _validate_decision_plan(agent, invalid)
@@ -1449,12 +1479,14 @@ class MainSchedulingTests(unittest.IsolatedAsyncioTestCase):
                     next_execution_mode="synthesize",
                     description="task-0 accepted",
                     is_finished=True,
+                    task_summary=task_summary_draft(completed=True),
                 ),
                 SupervisorDecisionResult(
                     is_next_target=True,
                     description="task-1 accepted",
                     final_answer="final artifact",
                     is_finished=True,
+                    task_summary=task_summary_draft(completed=True),
                 ),
             ]
 
@@ -1546,6 +1578,7 @@ class MainSchedulingTests(unittest.IsolatedAsyncioTestCase):
                     next_executor_target="retry with evidence",
                     description="not complete",
                     is_finished=True,
+                    task_summary=task_summary_draft(completed=False),
                 )
 
             config = RuntimeConfig(

@@ -30,6 +30,7 @@ from MCP_functions.MCP_hosts import mcp_host
 from MCP_functions.Search.mcp_search_server import get_remote_mcp_link
 from MCP_functions.tool_registry import AgentRole, ToolRegistry
 from State.save_chat_history import save_chat_history
+from State.save_supervision_state_history import load_last_supervisor_seq
 from State.save_tool_result import (
     ToolResultLocator,
     ToolSummary,
@@ -189,7 +190,6 @@ class SupervisorDescriptionHistory:
         used = 0
         for entry in reversed(self.entries):
             item = entry.to_dict()
-            item["description"] = item["description"][:3000]
             size = len(json.dumps(item, ensure_ascii=False))
             if selected and used + size > max_chars:
                 break
@@ -206,7 +206,7 @@ class SupervisorDescriptionHistory:
             return ""
         return "；".join(
             f"{entry.phase}: {entry.description}"
-            for entry in self.entries[-5:]
+            for entry in self.entries[-2:]
         )
 
 
@@ -253,6 +253,8 @@ class SupervisorState:
     remaining_work: list[str] = field(default_factory=list)
     tool_event_seq: int | None = None
     evaluation_seq: int | None = None
+    task_summary: dict[str, Any] | None = None
+    task_outcome: dict[str, Any] | None = None
 
 
 @dataclass
@@ -368,6 +370,8 @@ class AgentState:
     )
     task_reusable_read_calls: dict[int, list[str]] = field(default_factory=dict)
     task_outcomes: dict[int, TaskOutcome] = field(default_factory=dict)
+    task_cumulative_summaries: dict[int, str] = field(default_factory=dict)
+    task_summary_saved_seqs: set[int] = field(default_factory=set)
 
 state = AgentState
 
@@ -425,6 +429,7 @@ def state_init(session_address, chat_id, query="", config=None):
         session_address=str(session_address),
         chat_id=str(chat_id),
         user_query=query,
+        supervisor_seq=load_last_supervisor_seq(session_address, chat_id),
         executor_model=config.executor_model,
         supervisor_model=config.supervisor_model,
         temperature=config.temperature,

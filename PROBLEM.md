@@ -2,6 +2,22 @@
 
 更新时间：2026-09-27
 
+## 2026-10-01：当前任务摘要实现
+
+以下旧问题分析保留作复现背景；以当前源码为准。本次新增的任务摘要行为为：
+
+- 每个 chat 在 session_address 下有独立的历史子目录 `chat_<编码后的 chat_id>_<摘要散列>`，其中只有一份 `task_summary.md`，所有 task 的累计记录追加到该文件。
+- 原始工具事实仍在 `tool_results.jsonl`；角色 JSONL 保留摘要、状态和证据引用。Supervisor decision 另外结构化保存 `task_summary` 和最终通过时的 `task_outcome`，不复制完整工具输出。
+- decision 默认接收本轮 Executor 结果、本轮验收和既有 TaskOutcome，只提示 task_summary.md 是否存在，不自动加载正文。模型对累计成果、历史依赖或推进条件没有特别准确的把握时，主动调用新增的 Supervisor-only `read_task_summary`。Host 绑定当前 session_address/chat_id，模型仅选择 task_id 和是否包含前序任务。返回各 task 的最新累计记录，排除未来任务，不把同一 task 旧轮次重复当作成果。
+- 历史查询后的结果仅保留在本轮局部 `memory_query_results`，模型每次查询一个工具后再决定是否继续补取证据；相同查询避免重复。该工具复用现有历史查询的轻量事件保存，不将查询正文再次复制进 tool_results.jsonl 或角色 State。本轮有效证据优先，历史未被推翻的成果继续保留。
+- decision 内生成和校验摘要，先更新 AgentState / SupervisorState；最终通过时更新 TaskOutcome。保存 decision JSONL 后，以对应 task_id / Supervisor seq 和已更新参数组装 Markdown，复用现有 `write_in` 保存。
+- `write_in` 是原子覆盖写，不支持追加；因此先读取原内容、拼接完整新记录，再调用它覆盖写。按 task_id + Supervisor seq 标记避免重试重复保存；写入失败进入现有异常处理，不推进 task_id。
+- description 的提示词要求少于 3000 字符；代码只检查字符串和非空，超过 3000 不报错、不重试，历史保留完整文本。兜底聊天摘要使用最近两条完整 Supervisor description，通常约在 6000 字符内，也不会因长度报错。
+- TaskOutcome 的 accepted_summary / verification_summary 由最终 decision 结合多轮仍有效成果生成，分别回答累计完成成果和实际验收依据。默认上限沿用 3500 / 1500 字符，通过 `CODING_AGENT_ACCEPTED_SUMMARY_MAX_CHARS` / `CODING_AGENT_VERIFICATION_SUMMARY_MAX_CHARS` 配置；超限反馈模型重写，没有硬截断。
+- 旧 JSONL 不回写；缺少新字段的历史保持可读，不自动将旧记录推断成正式 TaskOutcome。已有会话的 Supervisor seq 从该 chat 的 JSONL 最大 seq 继续。
+
+验证覆盖摘要追加、chat 隔离、多轮累计、旧结论修正、否决权、长度行为、状态先更新后保存、重试去重和写入失败阻止推进。使用模拟模型与工具的离线测试；真实模型生成质量和同一 chat 多进程同时执行未验证。
+
 ## 1. 当前最大问题：跨轮记忆不是“可复用证据”
 
 当前系统已经会把 Executor、Supervisor 和最终聊天写入 JSONL，也提供历史查询工具。但上次真实运行证明：保存记录不等于下一轮 Agent 能稳定使用记录。

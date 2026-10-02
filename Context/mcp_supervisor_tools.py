@@ -6,9 +6,34 @@ from mcp import StdioServerParameters
 from mcp.server import FastMCP
 
 from Context.History_Resorce.mcp_supervisor_history import read_supervisor_history
+from State.task_summary import read_task_summary_context
 
 
 mcp_server = FastMCP("supervisor history tools")
+
+
+@mcp_server.tool(
+    name="read_task_summary",
+    description=(
+        "读取当前 chat 的 task_summary.md 中指定 task_id 的最新累计任务摘要，包含仍有效成果、"
+        "验收、修正结论、遗留工作和证据定位。对累计成果、历史依赖或任务推进条件没有特别"
+        "准确的把握时先调用；最新执行结果和验收已经充分时可直接决策。默认只读取指定 task；"
+        "include_other_tasks=true 时同时读取早于它的任务最新摘要。session_address/chat_id "
+        "由 Host 强制绑定，模型只选择 task_id 和 include_other_tasks；找不到返回 not_found。"
+    ),
+)
+async def read_task_summary(
+    session_address: str,
+    chat_id: str,
+    task_id: int,
+    include_other_tasks: bool = False,
+):
+    return read_task_summary_context(
+        session_address=session_address,
+        chat_id=chat_id,
+        current_task_id=task_id,
+        include_other_tasks=include_other_tasks,
+    )
 
 
 def read_supervisor_task_history(

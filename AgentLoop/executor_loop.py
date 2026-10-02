@@ -22,6 +22,7 @@ from AgentLoop.loop_utils import (
     call_chat_function,
     normalize_tool_calls,
     parse_json_object,
+    validate_description,
 )
 from MCP_functions.tool_registry import AgentRole, ToolRegistry
 from State.save_executor_state_history import save_state_history
@@ -44,7 +45,7 @@ EXECUTOR_PROMPT = """
 
 输出与证据：
 5. 选择工具时返回一个原生结构化工具调用即可；没有工具调用时只返回下方 JSON，不添加 Markdown、解释前缀或额外字段。
-6. description 记录本步新增事实、精确路径或 locator、与完成条件的关系及仍缺少什么。不要重复粘贴此前完整目录树、完整依赖列表或所有历史摘要。
+6. description 必须少于 3000 个字符，只记录本轮实际执行、关键结果、完成与验证情况及仍缺少什么。不要重复粘贴 tool_result、此前完整目录树、完整依赖列表或整个历史过程。
 7. 工具总结应以本次 observation 的增量为主；若任务未完成，只指出最必要的下一步。综合模式下才输出完整的最终说明。
 8. is_finished 判断整个当前 target 是否已满足 completion_criteria，不是判断单次工具是否成功。证据不足时必须为 false；工具无报错不能单独证明完成。
 9. selected_skill 可为 null；若选择，必须对应 skills 中真实 id/name，且 skill 不授予额外工具权限。
@@ -100,10 +101,7 @@ class ExecutorOutPut(BaseModel):
     @field_validator("description")
     @classmethod
     def validate_description(cls, value):
-        value = value.strip()
-        if not value:
-            raise ValueError("description 不能为空或只包含空白字符")
-        return value
+        return validate_description(value)
 
     @field_validator("tool_name")
     @classmethod
@@ -241,9 +239,7 @@ async def run_executor_loop(
                     _remember(executor_state, description)
                     continue
 
-                description = bounded_text(
-                    output.description, DESCRIPTION_MAX_CHARS, keep_tail=True
-                )
+                description = output.description
                 if description:
                     descriptions.append(description)
                     _remember(executor_state, description)
@@ -363,9 +359,7 @@ async def run_executor_loop(
                 executor_state,
             )
 
-            description = bounded_text(
-                summary.description, DESCRIPTION_MAX_CHARS, keep_tail=True
-            )
+            description = summary.description
             descriptions.append(description)
             _remember(executor_state, description)
             executor_state.tool_summaries.append(
@@ -408,11 +402,7 @@ async def run_executor_loop(
             exit_reason = "executor_exception"
             break
 
-    executor_state.output_content = bounded_text(
-        "\n".join(item for item in descriptions if item),
-        DESCRIPTION_MAX_CHARS,
-        keep_tail=True,
-    )
+    executor_state.output_content = "\n".join(item for item in descriptions if item)
     executor_state.exit_reason = exit_reason
     task_id = now_state.now_task_id
     now_state.task_previous_work.setdefault(task_id, []).append(
@@ -571,7 +561,7 @@ def _fallback_tool_summary(latest_tool_context, error):
     return ExecutorOutPut(
         tool_name=None,
         selected_skill=None,
-        description=bounded_text(description, DESCRIPTION_MAX_CHARS, keep_tail=True),
+        description=description,
         is_finished=False,
     )
 
@@ -587,7 +577,7 @@ async def _select_skill_before_action(
     prompt = """
 这是 Executor 的无工具 skill 选择阶段，尚未执行操作。
 只有某个 skill 与当前 target 直接匹配且能实质改变执行方法时才选择；否则 selected_skill 为 null。
-不要根据名称勉强选择，不要调用工具，不要声称任务完成。description 只说明选择理由，
+    不要根据名称勉强选择，不要调用工具，不要声称任务完成。description 必须少于 3000 个字符，只说明选择理由，
 is_finished 固定为 false，tool_name 固定为 null。仅返回 ExecutorOutPut JSON。
 """
     messages = build_model_messages(

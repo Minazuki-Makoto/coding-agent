@@ -197,6 +197,17 @@ def bounded_text(value, max_chars: int, keep_tail: bool = False):
     return (text[:head_chars] + separator + text[-tail_chars:])[:max_chars]
 
 
+def validate_description(value):
+    """Validate content; length is a writing preference, never a protocol error."""
+    field_name = "description"
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} 必须是字符串")
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field_name} 不能为空或只包含空白字符")
+    return value
+
+
 def parse_json_object(content: str):
     if not isinstance(content, str) or not content.strip():
         raise ValueError("model did not return a JSON object")

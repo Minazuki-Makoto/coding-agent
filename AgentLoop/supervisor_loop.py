@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from AgentLoop.loop_utils import (
     DESCRIPTION_MAX_CHARS,
@@ -16,6 +24,7 @@ from AgentLoop.loop_utils import (
     call_chat_function,
     normalize_tool_calls,
     parse_json_object,
+    validate_description,
 )
 from MCP_functions.tool_registry import (
     SUPERVISOR_ONLY_TOOLS,
@@ -25,6 +34,11 @@ from MCP_functions.tool_registry import (
 from State.save_executor_state_history import save_executor_review
 from State.save_supervision_state_history import save_supervisor_state_history
 from State.save_tool_result import ToolSummary, save_tool_result
+from State.task_summary import (
+    append_task_summary_record,
+    render_task_summary_record,
+    task_summary_path,
+)
 
 if TYPE_CHECKING:
     from AgentLoop.agent import (
@@ -41,6 +55,22 @@ PLAN_SKILL_PATH = PROJECT_ROOT / "Skills" / "supervisor_plan.md"
 DECISION_SKILL_PATH = PROJECT_ROOT / "Skills" / "supervisor_decison.md"
 MEMORY_RETRIEVAL_SKILL_NAME = "memory_retrieval.md"
 
+
+def _positive_limit_from_env(name, default):
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+TASK_OUTCOME_ACCEPTED_MAX_CHARS = _positive_limit_from_env(
+    "CODING_AGENT_ACCEPTED_SUMMARY_MAX_CHARS", 3500
+)
+TASK_OUTCOME_VERIFICATION_MAX_CHARS = _positive_limit_from_env(
+    "CODING_AGENT_VERIFICATION_SUMMARY_MAX_CHARS", 1500
+)
+
 SUPERVISOR_EVALUATION_PROMPT = """
 你是 Supervisor 的 evaluation 阶段，只验收上一轮 Executor 的委派目标，不推进 task、不改变完成条件。
 
@@ -51,7 +81,7 @@ SUPERVISOR_EVALUATION_PROMPT = """
 4. execution_mode=synthesize 时，允许依据 dependency_context 中已验收的 TaskOutcome 验证综合结果；不要要求综合任务重新产生工具调用。
 5. 只按锁定的 completion_criteria 判断，不临时增加“必须看到更多文件/原文”的要求。达到最小充分证据即可通过；不得用穷举所有文件代替验收。
 6. is_passed 只表示本轮委派目标通过；整个 task 是否推进由 decision 决定。is_error 只表示真实执行/工具错误，证据不足但无错误时保持 false。
-7. description 写简洁、可复用的核验事实和依据；reason 只写未通过或受阻的具体缺口。
+7. description 必须少于 3000 个字符，只写本轮实际检查、关键结果、验收结论和剩余缺口；不得复制原始工具输出或整段历史。reason 只写未通过或受阻的具体缺口。
 
 每步最多调用一个工具。需要继续查询时 is_finished=false；形成明确结论时为 true。无工具调用时仅返回 JSON：
 {
@@ -75,8 +105,10 @@ SUPERVISOR_DECISION_PROMPT = """
 4. 推进下一 task 时，next_executor_target 说明如何利用前序 TaskOutcome。下一项仍需新外部证据时 next_execution_mode=execute；只需总结、归纳或形成最终回答时必须为 synthesize。
 5. synthesize 会禁用 Executor 工具，因此只有 dependency_context 已足够支撑下一目标时才选择；不要让综合任务重新读取相同文件。
 6. 最后一个 task 完成时，final_answer 必须是可直接交付用户的实际答案，不是“任务已完成”等状态说明；不要再生成不存在的下一步。
-7. 只有确实缺少决策信息时才调用一个只读记忆工具；回溯只用于重新指导，不回滚磁盘、不重放旧工具。
-8. description 简洁说明控制决策依据，不重复粘贴 Executor 全部产出。
+7. 默认只提供历史摘要是否存在，不自动加载 task_summary.md 正文。对累计成果、旧结论是否仍有效、历史依赖或整个 task 的推进条件没有特别准确的把握时，先调用 read_task_summary，再作决定。最新执行、验收和已有 TaskOutcome 足够充分时可直接决策。需要具体原始字段时再按 locator 查询；回溯只用于重新指导，不回滚磁盘、不重放旧工具。
+8. 本轮最新结果和实际验证是主要依据；按需查到的历史辅助摘要只补充仍有效成果、依赖和遗留问题。新证据推翻旧结论时必须修正，未涉及的有效旧成果继续保留。Executor 声称完成但无必要验证时不得通过。memory_query_results 是本轮实际查询结果；已返回且足够时不要重复查询，not_found 或查询失败不代表验收通过。
+9. description 必须少于 3000 个字符，只说明本轮决策依据、关键结果和剩余工作，不复制原始工具输出或完整历史。
+10. task_summary 是本轮更新后的累计任务状态；每次完整 decision 都必须生成。只有当前 task 最终通过时，accepted_summary 和 verification_summary 才能写正式完成成果，否则必须为空。
 
 需要继续查询时 is_finished=false；形成明确决策后为 true。无工具调用时仅返回 JSON：
 {
@@ -92,7 +124,17 @@ SUPERVISOR_DECISION_PROMPT = """
   "date_back_input": "",
   "modify_content": "",
   "verification_requirement": "",
-  "final_answer": ""
+  "final_answer": "",
+  "task_summary": {
+    "current_turn_summary": "本轮实际执行与关键结果",
+    "cumulative_task_summary": "结合仍有效历史成果后的累计状态",
+    "current_verification_summary": "本轮检查、结果与证据依据",
+    "corrected_or_invalidated": [],
+    "remaining_work": [],
+    "next_step": "Supervisor 最新决定和下一步",
+    "accepted_summary": "仅最终通过时填写累计完成成果",
+    "verification_summary": "仅最终通过时填写通过依据"
+  }
 }
 """
 
@@ -101,8 +143,10 @@ class PlanningResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_list: list[str]
-    description: str = ""
+    description: str
     executor_guidance: str | None = None
+
+    _validate_description = field_validator("description")(validate_description)
 
     @field_validator("task_list")
     @classmethod
@@ -115,9 +159,11 @@ class PlanningResult(BaseModel):
 
 class InitialGuidance(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    description: str = ""
+    description: str
     executor_guidance: str
     completion_criteria: str
+
+    _validate_description = field_validator("description")(validate_description)
 
 
 class NeededCheck(BaseModel):
@@ -140,12 +186,14 @@ class SupervisorEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     is_passed: bool = False
-    description: str = ""
+    description: str
     is_error: bool = False
     reason: str = ""
     needed_check: NeededCheck | None = None
     skill: SupervisorSkill | None = None
     is_finished: bool = False
+
+    _validate_description = field_validator("description")(validate_description)
 
 
 class DateBack(BaseModel):
@@ -153,6 +201,59 @@ class DateBack(BaseModel):
     task_id: int
     chat_id: str
     session_address: str
+
+
+class TaskSummaryDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_turn_summary: str
+    cumulative_task_summary: str
+    current_verification_summary: str
+    corrected_or_invalidated: list[str] = Field(default_factory=list)
+    remaining_work: list[str] = Field(default_factory=list)
+    next_step: str
+    accepted_summary: str = ""
+    verification_summary: str = ""
+
+    @field_validator(
+        "current_turn_summary",
+        "cumulative_task_summary",
+        "current_verification_summary",
+        "next_step",
+    )
+    @classmethod
+    def validate_summary_descriptions(cls, value):
+        return validate_description(value)
+
+    @field_validator("corrected_or_invalidated", "remaining_work")
+    @classmethod
+    def validate_summary_lists(cls, value):
+        cleaned = []
+        for item in value:
+            cleaned.append(validate_description(item))
+        return cleaned
+
+    @field_validator("accepted_summary")
+    @classmethod
+    def validate_accepted_summary(cls, value):
+        value = value.strip()
+        if len(value) > TASK_OUTCOME_ACCEPTED_MAX_CHARS:
+            raise ValueError(
+                "accepted_summary 超过配置上限 "
+                f"{TASK_OUTCOME_ACCEPTED_MAX_CHARS}；请保留最终累计成果并重写"
+            )
+        return value
+
+    @field_validator("verification_summary")
+    @classmethod
+    def validate_verification_summary(cls, value):
+        value = value.strip()
+        if len(value) > TASK_OUTCOME_VERIFICATION_MAX_CHARS:
+            raise ValueError(
+                "verification_summary 超过配置上限 "
+                f"{TASK_OUTCOME_VERIFICATION_MAX_CHARS}；请保留验收条件、检查结果和证据定位并重写"
+            )
+        return value
 
 
 class SupervisorDecisionResult(BaseModel):
@@ -164,17 +265,28 @@ class SupervisorDecisionResult(BaseModel):
     next_executor_target: str = ""
     next_execution_mode: Literal["execute", "synthesize"] = "execute"
     need_date_back: bool = False
-    description: str = ""
+    description: str
     is_finished: bool = False
     date_back_location: list[DateBack] = Field(default_factory=list)
     date_back_input: str = ""
     modify_content: str = ""
     verification_requirement: str = ""
     final_answer: str = ""
+    task_summary: TaskSummaryDraft | None = None
+
+    _validate_description = field_validator("description")(validate_description)
+
+    @model_validator(mode="after")
+    def require_task_summary_for_finished_decision(self):
+        if self.is_finished and self.task_summary is None:
+            raise ValueError("完整 decision 必须包含 task_summary")
+        return self
 
 
 class SupervisorHistorySummary(BaseModel):
     description: str
+
+    _validate_description = field_validator("description")(validate_description)
 
 
 async def supervisor_making_plan(
@@ -488,6 +600,8 @@ async def making_next_plan_loop(
 ):
 
     print("===============进入supervisor_making_decision阶段======================")
+    memory_query_results = []
+    queried_memory_calls = set()
     rounds = 0
     while rounds < now_state.max_supervision_times:
 
@@ -498,6 +612,7 @@ async def making_next_plan_loop(
             supervisor_evaluation_state,
             executor_state,
             supervisor,
+            memory_query_results,
         )
         response = await _call_supervisor_model(
             now_state,
@@ -513,6 +628,7 @@ async def making_next_plan_loop(
                 response.get("message") or "decision model request failed"
             )
             break
+
         _record_supervisor_model_response(supervisor_state, "decision", response)
         calls = normalize_tool_calls(supervisor, response["tool"])
         if len(calls) > 1:
@@ -526,6 +642,22 @@ async def making_next_plan_loop(
             decision_response = response
         else:
             call = calls[0]
+            query_arguments = {
+                key: value for key, value in call.arguments.items()
+                if key not in {"session_address", "chat_id"}
+            }
+            if call.name == "read_task_summary":
+                query_arguments.setdefault("include_other_tasks", False)
+            query_fingerprint = _memory_query_fingerprint(
+                call.name, query_arguments,
+            )
+            if call.name in SUPERVISOR_ONLY_TOOLS and query_fingerprint in queried_memory_calls:
+                supervisor_state.memory_window.append(
+                    f"同一历史查询已执行：{call.name}。请使用 memory_query_results 中的结果；"
+                    "若仍无准确把握，缩小缺口后选择其他 task 或证据 locator，不重复同一查询。"
+                )
+                del supervisor_state.memory_window[:-10]
+                continue
             tool_result = await tool_registry.call(
                 AgentRole.SUPERVISOR, call.name, call.arguments
             )
@@ -537,14 +669,26 @@ async def making_next_plan_loop(
                 tool_result,
                 "decision",
             )
+
+            if call.name in SUPERVISOR_ONLY_TOOLS:
+                queried_memory_calls.add(query_fingerprint)
+                memory_query_results.append(
+                    _memory_query_observation(call.name, call.arguments, tool_result)
+                )
+                del memory_query_results[:-6]
+                # Query facts stay local to this decision, never in long-lived State or JSONL.
+                continue
+
             messages.extend(
                 build_tool_observation_messages(
                     supervisor, response.get("message"), call, tool_result
                 )
             )
+
             summary, parsed_result = await _validated_tool_summary(
                 now_state, chat_function, supervisor_client, supervisor, messages,
                 SupervisorDecisionResult, supervisor_state, "decision_summary",
+                evaluation_state=supervisor_evaluation_state,
             )
             if parsed_result is None:
                 supervisor_state.exit_reason = (
@@ -558,6 +702,9 @@ async def making_next_plan_loop(
                 parse_json_object(decision_response.get("message"))
             )
             _validate_decision_plan(now_state, result)
+            _validate_task_summary_for_decision(
+                result, supervisor_evaluation_state
+            )
         except (ValueError, ValidationError) as exc:
             supervisor_state.validation_error = str(exc)
             feedback = (
@@ -579,8 +726,18 @@ async def making_next_plan_loop(
             now_state, supervisor_state, supervisor_evaluation_state,
             executor_state, result
         )
-        _save_supervisor_turn(now_state, supervisor_state, "decision", result.description)
+        decision_seq = _save_supervisor_turn(
+            now_state, supervisor_state, "decision", result.description
+        )
         if result.is_finished:
+            _persist_task_summary(
+                now_state,
+                supervisor_state,
+                supervisor_evaluation_state,
+                executor_state,
+                result,
+                decision_seq,
+            )
             return result
 
     blocked = SupervisorDecisionResult(
@@ -588,13 +745,33 @@ async def making_next_plan_loop(
         next_executor_target="Supervisor 决策未完成，需人工检查验收记录后继续。",
         description="Supervisor 决策达到上限。",
         is_finished=True,
+        task_summary=TaskSummaryDraft(
+            current_turn_summary="本轮未形成有效的 Supervisor 控制决策。",
+            cumulative_task_summary=(
+                now_state.task_cumulative_summaries.get(now_state.now_task_id, "")
+                + "\n本轮决策未完成，没有新增可确认成果；此前仍有效成果予以保留。"
+            ).strip(),
+            current_verification_summary="Decision 重试达到上限，未产生新的通过结论。",
+            remaining_work=["人工检查本轮验收记录并重新形成决策。"],
+            next_step="保持当前 task，不推进 task_id。",
+        ),
     )
     supervisor_state.exit_reason = "decision_budget_exhausted"
     _apply_decision(
         now_state, supervisor_state, supervisor_evaluation_state,
         executor_state, blocked
     )
-    _save_supervisor_turn(now_state, supervisor_state, "decision_blocked", blocked.description)
+    decision_seq = _save_supervisor_turn(
+        now_state, supervisor_state, "decision_blocked", blocked.description
+    )
+    _persist_task_summary(
+        now_state,
+        supervisor_state,
+        supervisor_evaluation_state,
+        executor_state,
+        blocked,
+        decision_seq,
+    )
     return blocked
 
 
@@ -616,45 +793,56 @@ async def summarize_supervisor_descriptions(
 2. 重要决策与仍有效的约束；
 3. 最终交付状态；若受阻，只写直接阻塞点和仍缺内容。
 不要逐轮复述、复制完整工具输出或把未验收操作写成完成。若 answer 已是完整交付，只概括其依据，
-不另造结论。仅返回 JSON：
+    不另造结论。description 必须少于 3000 个字符，不复制完整历史或工具输出。仅返回 JSON：
 {"description": "面向后续上下文恢复的精炼总结"}
 """
-    response = await _call_supervisor_model(
-        now_state,
-        chat_function,
-        supervisor_client,
+    messages = build_model_messages(
         supervisor,
-        build_model_messages(
+        prompt,
+        {
+            "user_query": bounded_text(
+                now_state.user_query, USER_QUERY_MAX_CHARS
+            ),
+            "status": status,
+            "answer": bounded_text(answer, DESCRIPTION_MAX_CHARS),
+            "block_reason": block_reason,
+            "supervisor_descriptions": (
+                now_state.supervisor_descriptions.model_context()
+            ),
+            "task_outcomes": [
+                outcome.to_dict()
+                for _, outcome in sorted(now_state.task_outcomes.items())
+            ],
+        },
+    )
+    summary = None
+    retry_messages = list(messages)
+    for _ in range(now_state.max_supervision_times):
+        response = await _call_supervisor_model(
+            now_state,
+            chat_function,
+            supervisor_client,
             supervisor,
-            prompt,
-            {
-                "user_query": bounded_text(
-                    now_state.user_query, USER_QUERY_MAX_CHARS
-                ),
-                "status": status,
-                "answer": bounded_text(answer, DESCRIPTION_MAX_CHARS),
-                "block_reason": block_reason,
-                "supervisor_descriptions": (
-                    now_state.supervisor_descriptions.model_context()
-                ),
-                "task_outcomes": [
-                    outcome.to_dict()
-                    for _, outcome in sorted(now_state.task_outcomes.items())
-                ],
-            },
-        ),
-        [],
-    )
-    if response["status"] != "success" or response["tool"]:
-        raise RuntimeError(
-            response.get("message") or "Supervisor final summary failed"
+            retry_messages,
+            [],
         )
-    summary = SupervisorHistorySummary.model_validate(
-        parse_json_object(response.get("message"))
-    )
-    description = bounded_text(
-        summary.description, DESCRIPTION_MAX_CHARS, keep_tail=True
-    )
+        if response["status"] != "success" or response["tool"]:
+            feedback = "final summary 必须返回无工具调用的完整 JSON。"
+        else:
+            try:
+                summary = SupervisorHistorySummary.model_validate(
+                    parse_json_object(response.get("message"))
+                )
+                break
+            except (ValueError, ValidationError) as exc:
+                feedback = _validation_feedback("final summary", exc)
+        retry_messages = [
+            *retry_messages,
+            {"role": "user", "content": feedback},
+        ]
+    if summary is None:
+        raise RuntimeError("Supervisor final summary validation exhausted")
+    description = summary.description
     _save_supervisor_turn(
         now_state, supervisor_state, "final_summary", description
     )
@@ -670,6 +858,7 @@ def _build_supervisor_evaluation_message(
     selected_skill=None,
     memory_query_results=None,
 ):
+
     information = {
         "session_address": now_state.session_address,
         "chat_id": now_state.chat_id,
@@ -721,14 +910,50 @@ def _build_decision_message(
     supervisor_evaluation_state,
     executor_state,
     supervisor,
+    memory_query_results=None,
 ):
+    current_outcome = now_state.task_outcomes.get(now_state.now_task_id)
     information = {
         "session_address": now_state.session_address,
         "chat_id": now_state.chat_id,
         "task_list": list(now_state.task_list),
         "now_task_id": now_state.now_task_id,
         "now_target": now_state.now_target,
-        "executor_target": executor_state.supervisor_guidance,
+        "current_turn_latest_result": {
+            "executor_target": executor_state.supervisor_guidance,
+            "executor_summary": executor_state.output_content,
+            "executor_is_finished": executor_state.is_finished,
+            "executor_tool_result_locators": list(executor_state.tool_result_refs),
+            "tool_summaries": list(executor_state.tool_summaries),
+        },
+        "current_turn_supervisor_evaluation": {
+            "description": supervisor_evaluation_state.output_content,
+            "is_passed": supervisor_evaluation_state.is_executor_passed,
+            "reason": supervisor_evaluation_state.not_pass_reason,
+            "is_error": supervisor_evaluation_state.is_executor_error,
+            "error_message": supervisor_evaluation_state.executor_error_message,
+        },
+        "historical_auxiliary_summary": {
+            "status": (
+                "queried" if any(
+                    item.get("tool_name") == "read_task_summary"
+                    for item in memory_query_results or []
+                ) else "not_loaded"
+            ),
+            "available": task_summary_path(
+                now_state.session_address, now_state.chat_id
+            ).is_file(),
+            "tool_name": "read_task_summary",
+            "task_id": now_state.now_task_id,
+        },
+        "memory_query_results": list(memory_query_results or []),
+        "current_task_outcome": (
+            current_outcome.to_dict() if current_outcome is not None else None
+        ),
+        "task_outcome_length_limits": {
+            "accepted_summary": TASK_OUTCOME_ACCEPTED_MAX_CHARS,
+            "verification_summary": TASK_OUTCOME_VERIFICATION_MAX_CHARS,
+        },
         "supervisor_evaluation_result": supervisor_evaluation_state.output_content,
         "executor_is_passed": supervisor_evaluation_state.is_executor_passed,
         "executor_not_pass_reason": supervisor_evaluation_state.not_pass_reason,
@@ -794,7 +1019,8 @@ async def _prepare_initial_guidance(
 规划已经完成，当前没有 Executor 输出。这里只为 task_list[0] 建立第一次 handoff，不进行验收。
 executor_guidance 应说明当前 task 的最小执行范围、优先工具/路径、停止条件和必要异常处理；
 不要要求一次穷举整个项目，也不要提前执行后续 task。completion_criteria 必须是稳定、最小充分、
-可由真实结果核验的证据标准，后续不得因为“更放心”随意扩大。仅返回 JSON：
+    可由真实结果核验的证据标准，后续不得因为“更放心”随意扩大。description 必须少于 3000 个字符，
+    不复制历史或工具原文。仅返回 JSON：
 {
   "description": "指导依据与范围边界",
   "executor_guidance": "当前 task 的具体步骤、停止条件和证据记录方式",
@@ -917,6 +1143,7 @@ def _apply_decision(now_state, supervisor_state, evaluation_state, executor_stat
     if evaluation_state.is_executor_passed and executor_state.output_content:
         if executor_state.output_content not in accepted_work:
             accepted_work.append(executor_state.output_content)
+
     remaining_work = [] if result.is_next_target else [
         item for item in (
             result.next_executor_target,
@@ -924,24 +1151,27 @@ def _apply_decision(now_state, supervisor_state, evaluation_state, executor_stat
             evaluation_state.not_pass_reason,
         ) if item
     ]
+
     now_state.task_accepted_work[task_id] = accepted_work
     now_state.task_remaining_work[task_id] = remaining_work
+    if result.task_summary is not None:
+        now_state.task_cumulative_summaries[task_id] = (
+            result.task_summary.cumulative_task_summary
+        )
+        supervisor_state.task_summary = result.task_summary.model_dump()
+    else:
+        supervisor_state.task_summary = None
+    supervisor_state.task_outcome = None
+
     current_handoff = now_state.task_handoffs.get(task_id)
     if result.is_next_target and evaluation_state.is_executor_passed:
         from AgentLoop.agent import TaskOutcome
 
-        accepted_source = (
-            accepted_work[-1] if accepted_work else evaluation_state.description
-        )
         now_state.task_outcomes[task_id] = TaskOutcome(
             task_id=task_id,
             target=now_state.now_target,
-            accepted_summary=bounded_text(
-                accepted_source, 3500, keep_tail=True
-            ),
-            verification_summary=bounded_text(
-                evaluation_state.description, 1500, keep_tail=True
-            ),
+            accepted_summary=result.task_summary.accepted_summary,
+            verification_summary=result.task_summary.verification_summary,
             evidence_references=list(
                 now_state.task_evidence_references.get(task_id, [])
             ),
@@ -949,6 +1179,7 @@ def _apply_decision(now_state, supervisor_state, evaluation_state, executor_stat
                 now_state.task_reusable_read_calls.get(task_id, [])
             ),
         )
+        supervisor_state.task_outcome = now_state.task_outcomes[task_id].to_dict()
 
     from AgentLoop.agent import SupervisorHandoff
     handoff = SupervisorHandoff(
@@ -976,6 +1207,79 @@ def _apply_decision(now_state, supervisor_state, evaluation_state, executor_stat
     supervisor_state.original_completion_criteria = handoff.completion_criteria
     supervisor_state.accepted_work = accepted_work
     supervisor_state.remaining_work = remaining_work
+
+
+def _validate_task_summary_for_decision(result, evaluation_state):
+    if result.is_next_target and not evaluation_state.is_executor_passed:
+        raise ValueError("Supervisor evaluation 未通过，不允许推进 task")
+    if result.is_next_target and not result.is_finished:
+        raise ValueError("is_next_target=true 时 decision 必须同时 is_finished=true")
+    if not result.is_finished:
+        return
+    draft = result.task_summary
+    if draft is None:
+        raise ValueError("完整 decision 必须包含 task_summary")
+    task_is_accepted = result.is_next_target and evaluation_state.is_executor_passed
+    if task_is_accepted:
+        if not draft.accepted_summary:
+            raise ValueError("最终通过的 task 必须生成 accepted_summary")
+        if not draft.verification_summary:
+            raise ValueError("最终通过的 task 必须生成 verification_summary")
+    elif draft.accepted_summary or draft.verification_summary:
+        raise ValueError(
+            "当前 task 未最终通过，accepted_summary 和 verification_summary 必须为空"
+        )
+
+
+def _persist_task_summary(
+    now_state,
+    supervisor_state,
+    evaluation_state,
+    executor_state,
+    result,
+    decision_seq,
+):
+    task_id = now_state.now_task_id
+    if decision_seq in now_state.task_summary_saved_seqs:
+        return
+    if supervisor_state.task_summary is None:
+        raise ValueError("cannot persist task summary before state has been updated")
+    if supervisor_state.task_id != task_id or supervisor_state.supervisor_seq != decision_seq:
+        raise ValueError("task summary state does not match the current task and seq")
+    draft = TaskSummaryDraft.model_validate(supervisor_state.task_summary)
+    evidence = [
+        reference.to_dict()
+        for reference in now_state.task_evidence_references.get(task_id, [])
+    ]
+    known_result_seqs = {
+        item.get("tool_result_seq") for item in evidence if isinstance(item, dict)
+    }
+    for locator in now_state.task_evidence_locators.get(task_id, []):
+        if locator.get("tool_result_seq") in known_result_seqs:
+            continue
+        evidence.append(dict(locator))
+    record = render_task_summary_record(
+        task_id=task_id,
+        supervisor_seq=decision_seq,
+        target=supervisor_state.target,
+        current_turn_summary=draft.current_turn_summary,
+        cumulative_task_summary=draft.cumulative_task_summary,
+        current_verification_summary=draft.current_verification_summary,
+        corrected_or_invalidated=list(draft.corrected_or_invalidated),
+        remaining_work=list(draft.remaining_work),
+        decision_summary=supervisor_state.description,
+        next_step=draft.next_step,
+        evidence_references=evidence,
+        task_outcome=supervisor_state.task_outcome,
+    )
+    append_task_summary_record(
+        session_address=now_state.session_address,
+        chat_id=now_state.chat_id,
+        task_id=task_id,
+        supervisor_seq=decision_seq,
+        record=record,
+    )
+    now_state.task_summary_saved_seqs.add(decision_seq)
 
 
 def _reset_supervisor_turn(now_state, supervisor_state, evaluation_state):
@@ -1010,6 +1314,8 @@ def _reset_supervisor_turn(now_state, supervisor_state, evaluation_state):
     )
     supervisor_state.tool_event_seq = None
     supervisor_state.evaluation_seq = None
+    supervisor_state.task_summary = None
+    supervisor_state.task_outcome = None
     evaluation_state.supervisor_seq = now_state.supervisor_seq
     evaluation_state.chat_id = now_state.chat_id
     evaluation_state.task_id = now_state.now_task_id
@@ -1147,6 +1453,7 @@ async def _validated_tool_summary(
     supervisor_state,
     stage,
     memory_state=None,
+    evaluation_state=None,
 ):
     retry_messages = list(messages)
     for _ in range(now_state.max_supervision_times):
@@ -1163,6 +1470,8 @@ async def _validated_tool_summary(
                 )
                 if isinstance(result, SupervisorDecisionResult):
                     _validate_decision_plan(now_state, result)
+                    if evaluation_state is not None:
+                        _validate_task_summary_for_decision(result, evaluation_state)
                 locator = supervisor_state.last_tool_result_ref
                 if locator is not None:
                     supervisor_state.tool_summaries.append(
