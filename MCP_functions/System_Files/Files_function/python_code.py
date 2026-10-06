@@ -1,4 +1,5 @@
 import subprocess
+from MCP_functions.sandbox import execution_run, check_path
 import sys
 from pathlib import Path
 
@@ -6,19 +7,23 @@ from pathlib import Path
 def find_the_python_editor(home_address: str = None,editor_set:set = None):
 
     if home_address is None:
-        home_address = Path("C:/")
+        home_address = check_path(Path.cwd())
     else:
-        home_address = Path(home_address)
+        home_address = check_path(home_address)
 
     if editor_set is None:
         editor_set=set()
 
     for subpath in home_address.iterdir():
+        try:
+            check_path(subpath)
+        except PermissionError:
+            continue
 
         if subpath.is_file():
             if subpath.name.lower() == "python.exe":
                 try:
-                    result = subprocess.run(
+                    result = execution_run(
                         [
                             str(subpath),
                             "-I",
@@ -28,7 +33,7 @@ def find_the_python_editor(home_address: str = None,editor_set:set = None):
                         capture_output=True,
                         text=True,
                         timeout=3,
-                        creationflags=subprocess.CREATE_NO_WINDOW
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                     )
 
                     if result.returncode == 0 and result.stdout.strip() == "PYTHON_CHECK_OK":
@@ -66,8 +71,8 @@ def run_code_get_feedback(
         code_path: str
 ):
     try:
-        editor_address = Path(editor_address)
-        code_path = Path(code_path)
+        editor_address = check_path(editor_address)
+        code_path = check_path(code_path)
 
         if not editor_address.is_file():
             return {
@@ -81,7 +86,7 @@ def run_code_get_feedback(
                 "message": "code file does not exist"
             }
 
-        result = subprocess.run(
+        result = execution_run(
             [
                 str(editor_address),
                 str(code_path)
@@ -109,7 +114,7 @@ def run_code_get_feedback(
 
     except subprocess.TimeoutExpired:
         return {
-            "status": "error",
+            "status": "unknown",
             "message": "program execution timed out"
         }
 
@@ -162,7 +167,7 @@ def download_package(
         }
 
     try:
-        result = subprocess.run(
+        result = execution_run(
             [
                 str(editor_address),
                 "-m", "pip", "install", "--no-input",
@@ -173,7 +178,7 @@ def download_package(
             capture_output=True,
             text=True,
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
 
         return {
@@ -186,7 +191,7 @@ def download_package(
 
     except subprocess.TimeoutExpired:
         return {
-            "status": "error",
+            "status": "unknown",
             "message": "package installation timed out; the environment may have changed"
         }
     except OSError as e:

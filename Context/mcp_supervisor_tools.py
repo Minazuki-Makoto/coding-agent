@@ -1,3 +1,4 @@
+from State.session_checkpoint import record_visible
 import json
 import sys
 from pathlib import Path
@@ -57,6 +58,10 @@ def read_supervisor_task_history(
                 continue
 
             history = json.loads(line)
+
+            if not record_visible(history):
+
+                continue
             if not isinstance(history, dict):
                 continue
             if history.get("chat_id") != chat_id:

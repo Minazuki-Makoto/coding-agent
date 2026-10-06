@@ -1,4 +1,5 @@
 from pathlib import Path
+from MCP_functions.sandbox import check_path, PermissionDenied
 
 
 IGNORED_FILE_NAMES = {
@@ -43,6 +44,7 @@ def _unsafe_content_reason(path: Path):
 
 
 def _file_metadata(path: Path):
+    path = check_path(path)
     return {
         "file_name": path.name,
         "address": str(path.resolve()),
@@ -51,6 +53,7 @@ def _file_metadata(path: Path):
 
 
 def _directory_metadata(path: Path):
+    path = check_path(path)
     return {
         "folder_name": path.name,
         "address": str(path.resolve()),
@@ -58,6 +61,7 @@ def _directory_metadata(path: Path):
 
 
 def _read_text_preview(path: Path, remaining_chars: int):
+    path = check_path(path)
     if remaining_chars <= 0:
         return None, "total_content_budget_exhausted", 0
     allowed_chars = min(MAX_FILE_CONTENT_CHARS, remaining_chars)
@@ -74,6 +78,7 @@ def _read_text_preview(path: Path, remaining_chars: int):
 
 
 def _read_text_page(path: Path, start_char: int, max_chars: int):
+    path = check_path(path)
     try:
         with path.open("r", encoding="utf-8-sig") as stream:
             remaining = start_char
@@ -100,7 +105,10 @@ def read_all_files(home_address: str, start_index: int = 0, max_entries: int = 2
     if page_error:
         return {"status": "error", "message": page_error}
 
-    path = Path(home_address).expanduser()
+    try:
+        path = check_path(home_address)
+    except PermissionError as exc:
+        return {"status": "error", "message": str(exc)}
     if not path.exists():
         return {"status": "error", "message": "please provide a valid home address"}
     if path.is_file():
@@ -169,7 +177,10 @@ def read_files_content(
     if page_error:
         return {"status": "error", "message": page_error}
 
-    path = Path(home_address).expanduser()
+    try:
+        path = check_path(home_address)
+    except PermissionError as exc:
+        return {"status": "error", "message": str(exc)}
     if not path.exists():
         return {"status": "error", "message": "please provide a valid home address"}
     if path.is_file():

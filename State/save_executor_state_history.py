@@ -24,6 +24,8 @@ def _validate_location(current_state):
 
 def _append_record(session_address: Path, record: dict):
     session_address.mkdir(parents=True, exist_ok=True)
+    from State.session_checkpoint import annotate_record
+    annotate_record(record, "executor_history.jsonl")
     with (session_address / "executor_history.jsonl").open(
         "a", encoding="utf-8"
     ) as history_file:

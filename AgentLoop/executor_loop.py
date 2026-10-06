@@ -124,7 +124,12 @@ async def run_executor_loop(
     supervisor_state: SupervisorState,
     executor_state: ExecutorState,
 ):
-    _reset_executor_turn(now_state, supervisor_state, executor_state)
+    from State.session_checkpoint import active_run, boundary
+    run = active_run()
+    resuming = bool(run and run.resume and run.phase in {"executor_action", "executor_tool_summary"})
+    resume_payload = dict(run.payload) if resuming else {}
+    if not resuming:
+        _reset_executor_turn(now_state, supervisor_state, executor_state)
     handoff = executor_state.input_content["supervisor_handoff"]
     execution_mode = handoff.get("execution_mode", "execute")
     active_executor_tools = [] if execution_mode == "synthesize" else executor_tools
@@ -135,15 +140,18 @@ async def run_executor_loop(
         for signature in outcome.get("reusable_read_calls", [])
         if isinstance(signature, str)
     }
-    selected_skill = None
-    descriptions: list[str] = []
-    steps = 0
+    selected_skill = executor_state.selected_skill if resuming else None
+    descriptions: list[str] = list(resume_payload.get("descriptions", []))
+    steps = resume_payload.get("step", 0)
+    pending_summary = resume_payload if resuming and run.phase == "executor_tool_summary" else None
+    if run:
+        run.resume = False
     repeated_completed_calls: dict[str, int] = {}
     synthesis_tool_attempts = 0
     exit_reason = "executor_step_limit"
 
     print("====================进入executor执行轮======================")
-    if skill_lists:
+    if skill_lists and not resuming:
         selected_skill, selection_description = await _select_skill_before_action(
             now_state,
             executor,
@@ -157,12 +165,24 @@ async def run_executor_loop(
             descriptions.append(selection_description)
             _remember(executor_state, selection_description)
 
-    while steps < now_state.max_executor_steps:
+    if resuming and not pending_summary and executor_state.is_finished:
+        exit_reason = "executor_reported_finished"
+    while steps < now_state.max_executor_steps and not (resuming and not pending_summary and executor_state.is_finished):
         steps += 1
         print(f"\n\n第{steps}轮")
         now_state.executor_executing_times += 1
         try:
-            response = await _call_model(
+            if pending_summary:
+                from AgentLoop.loop_utils import NormalizedToolCall
+                args = pending_summary["arguments"]
+                name = pending_summary["tool_name"]
+                raw = {"id": "restored_observation", "type": "function", "function": {
+                    "name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+                restored_call = NormalizedToolCall("restored_observation", name, args, raw)
+                response = {"status": "success", "message": pending_summary.get("response_message"), "tool": []}
+            else:
+                boundary("executor_action", "executor", step=steps - 1, descriptions=descriptions)
+                response = await _call_model(
                 now_state,
                 chat_function,
                 executor_client,
@@ -186,7 +206,7 @@ async def run_executor_loop(
             )
             executor_state.validation_error = ""
 
-            tool_calls = normalize_tool_calls(executor, response["tool"])
+            tool_calls = [restored_call] if pending_summary else normalize_tool_calls(executor, response["tool"])
             if execution_mode == "synthesize" and tool_calls:
                 synthesis_tool_attempts += 1
                 description = (
@@ -262,8 +282,9 @@ async def run_executor_loop(
                 if reusable_signature in prior_reusable_read_calls
                 else fingerprint
             )
-            if (
+            if not pending_summary and (
                 fingerprint in handoff.get("completed_tool_calls", [])
+                or fingerprint in executor_state.completed_tool_calls
                 or reusable_signature in prior_reusable_read_calls
             ) and not _repeat_is_explicitly_requested(
                 handoff.get("instruction", "")
@@ -286,44 +307,63 @@ async def run_executor_loop(
                     exit_reason = "executor_repeated_completed_call"
                     break
                 continue
-            tool_result = await tool_registry.call(
+            operation = None
+            if pending_summary:
+                from State.save_tool_result import read_tool_result_record
+                from MCP_functions.tool_registry import ToolExecutionResult
+                raw_record = read_tool_result_record(now_state.session_address, now_state.chat_id,
+                                                     pending_summary["tool_result_seq"])
+                if raw_record["status"] != "success":
+                    raise RuntimeError("pending observation is unavailable; tool will not be replayed")
+                tool_result = ToolExecutionResult(**raw_record["record"]["content"])
+                locator = executor_state.last_tool_result_ref
+                pending_summary = None
+            else:
+                operation = None
+                if run:
+                    import uuid
+                    operation = uuid.uuid4().hex
+                    run.current_operation = operation
+                    run.emit("tool_intent", "executor", operation_id=operation,
+                             tool_name=tool_call.name, arguments=tool_call.arguments, status="started")
+                tool_result = await tool_registry.call(
                 role=AgentRole.EXECUTOR,
                 tool_name=tool_call.name,
                 arguments=tool_call.arguments,
             )
-            now_state.executor_seq += 1
-            executor_state.executor_seq = now_state.executor_seq
-            tool_event_seq = executor_state.executor_seq
-            executor_state.tool_event_seqs.append(tool_event_seq)
-            now_state.tool_result_seq += 1
-            locator = save_tool_result(
-                session_address=now_state.session_address,
-                chat_id=now_state.chat_id,
-                task_id=now_state.now_task_id,
-                actor="executor",
-                actor_turn_seq=tool_event_seq,
-                phase="execution",
-                tool_name=tool_call.name,
-                arguments=tool_call.arguments,
-                tool_result=tool_result,
-                tool_result_seq=now_state.tool_result_seq,
-            )
-            executor_state.last_tool_result_ref = locator
-            executor_state.tool_result_refs.append(locator)
-            executor_state.latest_tool_context = _build_latest_tool_context(
-                tool_call.name,
-                tool_result,
-                locator.tool_result_seq,
-            )
-            executor_state.tool_name = tool_call.name
-            executor_state.tool_arguments = tool_call.arguments
-            executor_state.tool_ok = tool_result.ok
-            executor_state.description = "工具已执行，等待观察总结。"
-            executor_state.is_error = not tool_result.ok
-            executor_state.error_message = (
-                "" if tool_result.ok else (tool_result.message or tool_result.error_type or "")
-            )
-            save_state_history(executor_state, record_type="tool_event")
+                now_state.executor_seq += 1
+                executor_state.executor_seq = now_state.executor_seq
+                tool_event_seq = executor_state.executor_seq
+                executor_state.tool_event_seqs.append(tool_event_seq)
+                now_state.tool_result_seq += 1
+                locator = save_tool_result(
+                    session_address=now_state.session_address,
+                    chat_id=now_state.chat_id,
+                    task_id=now_state.now_task_id,
+                    actor="executor",
+                    actor_turn_seq=tool_event_seq,
+                    phase="execution",
+                    tool_name=tool_call.name,
+                    arguments=tool_call.arguments,
+                    tool_result=tool_result,
+                    tool_result_seq=now_state.tool_result_seq,
+                )
+                executor_state.last_tool_result_ref = locator
+                executor_state.tool_result_refs.append(locator)
+                executor_state.latest_tool_context = _build_latest_tool_context(
+                    tool_call.name,
+                    tool_result,
+                    locator.tool_result_seq,
+                )
+                executor_state.tool_name = tool_call.name
+                executor_state.tool_arguments = tool_call.arguments
+                executor_state.tool_ok = tool_result.ok
+                executor_state.description = "工具已执行，等待观察总结。"
+                executor_state.is_error = not tool_result.ok
+                executor_state.error_message = (
+                    "" if tool_result.ok else (tool_result.message or tool_result.error_type or "")
+                )
+                save_state_history(executor_state, record_type="tool_event")
 
             if tool_result.ok:
                 if fingerprint not in executor_state.completed_tool_calls:
@@ -334,6 +374,16 @@ async def run_executor_loop(
                     tool_call.name,
                     tool_call.arguments,
                 )
+
+            if run and operation:
+                run.emit("tool_completed", "executor", operation_id=operation,
+                         tool_name=tool_call.name, tool_result_seq=locator.tool_result_seq,
+                         ok=tool_result.ok, status="success" if tool_result.ok else tool_result.error_type)
+                run.current_operation = None
+            boundary("executor_tool_summary", "executor", step=steps - 1,
+                     descriptions=descriptions, tool_result_seq=locator.tool_result_seq,
+                     tool_name=tool_call.name, arguments=tool_call.arguments,
+                     response_message=response.get("message"))
 
             messages = _build_executor_messages(
                 steps - 1,
@@ -373,6 +423,10 @@ async def run_executor_loop(
             executor_state.description = description
             executor_state.is_finished = summary.is_finished
             executor_state.is_error = not tool_result.ok
+            boundary("executor_action", "executor", step=steps, descriptions=descriptions)
+            if tool_result.error_type in {"unknown", "interrupted"}:
+                exit_reason = "executor_operation_unknown"
+                break
             if summary.is_finished:
                 exit_reason = "executor_reported_finished"
                 break
@@ -584,7 +638,7 @@ is_finished 固定为 false，tool_name 固定为 null。仅返回 ExecutorOutPu
         executor,
         prompt,
         {
-            "user_query": bounded_text(now_state.user_query, USER_QUERY_MAX_CHARS),
+            "user_query": now_state.user_query,
             "target": now_state.now_target,
             "supervisor_handoff": executor_state.input_content.get(
                 "supervisor_handoff", {}
@@ -618,9 +672,25 @@ is_finished 固定为 false，tool_name 固定为 null。仅返回 ExecutorOutPu
 
 
 async def _call_model(now_state, chat_function, client, provider, messages, tools):
+    from AgentLoop.context_compression import prepare_request
+    async def compression_call(compression_messages, compression_tools):
+        return await _counted_model_call(now_state, chat_function, client, provider,
+                                         compression_messages, compression_tools)
+    messages = await prepare_request(now_state, messages, tools, compression_call)
+    return await _counted_model_call(now_state, chat_function, client, provider, messages, tools)
+
+
+async def _counted_model_call(now_state, chat_function, client, provider, messages, tools):
+    if len(json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False)) > now_state.context_max_chars:
+        raise RuntimeError("context_budget_blocked: model/compression request exceeds hard character budget")
     if now_state.model_request_count >= now_state.max_model_requests:
         raise RuntimeError("model request budget exhausted")
     now_state.model_request_count += 1
+    from State.session_checkpoint import active_run
+    run = active_run()
+    if run:
+        run.emit("model_request", "executor", model_request_count=now_state.model_request_count)
+        run.checkpoint()
     response = await call_chat_function(
         chat_function=chat_function,
         provider=provider,
@@ -631,6 +701,8 @@ async def _call_model(now_state, chat_function, client, provider, messages, tool
         temperature=now_state.temperature,
     )
     now_state.total_token += response.get("total_tokens", 0)
+    if run:
+        run.checkpoint()
     return response
 
 
@@ -648,13 +720,13 @@ def _build_executor_messages(
         **executor_state.input_content,
         "step": time,
         "max_steps": now_state.max_executor_steps,
-        "user_query": bounded_text(now_state.user_query, USER_QUERY_MAX_CHARS),
+        "user_query": now_state.user_query,
         "environment": {"java": now_state.java, "python": now_state.python},
         "skills": [
             {"id": item.id, "name": item.name, "description": item.description}
             for item in skill_lists
         ],
-        "recent_descriptions": list(executor_state.memory_window)[-10:],
+        "recent_descriptions": list(executor_state.memory_window),
     }
     if include_latest_tool_context:
         information["latest_tool_context"] = executor_state.latest_tool_context
@@ -953,10 +1025,7 @@ def _repeat_is_explicitly_requested(instruction):
 
 def _remember(executor_state, description: str):
     if description:
-        executor_state.memory_window.append(
-            bounded_text(description, DESCRIPTION_MAX_CHARS, keep_tail=True)
-        )
-        del executor_state.memory_window[:-10]
+        executor_state.memory_window.append(description)
 
 
 def _build_validation_feedback(exc, raw_response):
@@ -1008,11 +1077,7 @@ def _load_selected_skill(skill_list, selection: SelectedSkill | None):
 
 def _read_skill(skill) -> str:
     try:
-        return bounded_text(
-            Path(skill.address).read_text(encoding="utf-8"),
-            DESCRIPTION_MAX_CHARS,
-            keep_tail=True,
-        )
+        return Path(skill.address).read_text(encoding="utf-8")
     except OSError:
         return ""
 

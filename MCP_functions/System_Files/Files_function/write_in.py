@@ -20,6 +20,11 @@ def _trusted_roots(override=None):
 def _resolve_allowed_path(file_address: str, trusted_roots=None):
     if not isinstance(file_address, str) or not file_address.strip():
         raise ValueError("file_address must be a non-empty string")
+    if trusted_roots is None:
+        from MCP_functions.sandbox import current_policy
+        policy = current_policy()
+        if policy is not None:
+            return policy.check_path(file_address, write=True)
     roots = _trusted_roots(trusted_roots)
     if not roots:
         raise PermissionError("no trusted writable root is configured by the host")

@@ -1,6 +1,6 @@
 # Coding Agent 当前项目说明
 
-更新时间：2026-10-01
+更新时间：2026-10-05
 
 本文记录当前源码的整体架构、运行顺序、状态和持久化边界，不把历史建议当作已实现功能。用户当前指令优先；本文与代码不一致时，重新核实源码。本文不是自动启动或修改项目的指令。
 
@@ -32,7 +32,7 @@
 coding_agent/
 ├── CODEX.md / PROBLEM.md / README.md
 ├── INFORMATION.json                     # 运行配置；不得输出凭据
-├── backend.py                           # 示例调用入口，不是完整 HTTP 服务
+├── backend.py / terminal_cli.py         # 交互终端入口，不是 HTTP 服务
 ├── AgentChat/
 │   ├── Chatgpt_chat.py / GLM_chat.py / Claude_chat.py
 │   └── DeepSeek_chat.py / Qwen_chat.py
@@ -40,7 +40,8 @@ coding_agent/
 │   ├── agent.py                         # 配置、dataclass、主调度与请求统计
 │   ├── executor_loop.py                 # 单工具执行、总结、证据与重复调用管理
 │   ├── supervisor_loop.py               # planning/evaluation/decision 与摘要生成
-│   └── loop_utils.py                    # 消息构造、JSON 转换、上下文窗口
+│   ├── loop_utils.py                    # 消息构造、JSON 转换
+│   └── context_compression.py           # 显式异步高阈值压缩与整体字符预算
 ├── Context/
 │   ├── mcp_resources.py                 # Executor 历史查询 MCP
 │   ├── mcp_supervisor_tools.py           # Supervisor 历史及任务摘要查询 MCP
@@ -51,6 +52,7 @@ coding_agent/
 │       └── mcp_supervisor_history.py
 ├── MCP_functions/
 │   ├── MCP_client.py / MCP_hosts.py / tool_registry.py
+│   ├── sandbox.py / execution_gateway.py # 可信路径、真实隔离后端与单次授权
 │   ├── Search/mcp_search_server.py       # 可选远程 MCP 配置
 │   ├── collect_information/collect.py / mcp_collect_server.py
 │   └── System_Files/
@@ -65,7 +67,9 @@ coding_agent/
 │   ├── save_supervision_state_history.py
 │   ├── save_chat_history.py
 │   ├── save_tool_result.py               # 原始结果、locator、summary、追加锁
-│   └── task_summary.py                   # chat 隔离、Markdown 记录与摘要读取
+│   ├── task_summary.py                   # chat 隔离、Markdown 记录与摘要读取
+│   └── session_checkpoint.py            # 类型化恢复、timeline、前置状态、分支
+├── sandbox/Dockerfile                   # 可信 Python/JDK 工具链镜像构建说明
 ├── ExecutorBooks/Executor_textbook.md / Executor_mistake_book.md
 └── tests/
     ├── test_agent_loop.py / test_bfs_read.py / test_java_code.py
@@ -76,14 +80,14 @@ coding_agent/
 
 ## 4. 主运行流程
 
-入口为异步 AgentLoop.agent.main(query, session_address, chat_id)。backend.py 创建 D:\coding-agent 下的随机会话目录和字符串 chat_id，再调用硬编码示例 query；虽创建 Flask 对象，但没有 HTTP 路由和服务启动逻辑。
+入口保留异步 AgentLoop.agent.main(query, session_address, chat_id)，backend.py 改为 terminal_cli.py 的终端启动入口。CLI 负责新建/精确恢复/连续问答、权限和授权；恢复或回退本身不运行模型、工具，/continue 才继续当前阶段。查看 README.md 的实际命令。
 
 ~~~text
 main：datetime.now() 记录开始时间
-  → 加载配置与角色 State，恢复已有 Supervisor / 原始工具编号
+  → 加载配置与角色 State，恢复已有 Executor / Supervisor / 原始工具编号；CLI 载入明确选择的 checkpoint
   → 启动 MCP，建立 ToolRegistry，加载 Supervisor skills
   → planning：生成顺序 task_list
-  → initial_guidance：为 task 0 生成指导、原始完成条件与 handoff
+  → initial_guidance：为本次请求的首个 task 生成指导、原始完成条件与 handoff
   → 当前 task：
       Executor 执行 → Supervisor evaluation → 保存 Executor review
       → Supervisor decision：
@@ -129,13 +133,13 @@ SupervisorState 保存计划、指导、推进与计划调整字段、最终答�
 - EvidenceReference：tool_result_seq、tool_name 和路径/状态等证据定位。
 - TaskOutcome：正式验收后的累计成果，包括 accepted_summary、verification_summary、证据和可复用读取。
 
-Executor execute 模式可调用工具；synthesize 模式关闭工具，只整合已验收的前置成果。成功调用签名避免重复操作，总结重试不重复执行成功工具；对象变化后是否应重新读取仍需正确指导。
+Executor execute 模式可调用工具；synthesize 模式关闭工具，只整合已验收的前置成果。成功调用签名覆盖本轮和跨尝试成功集合；允许不同参数、失败重试和明确重跑。总结重试不重复执行成功工具；对象变化后是否应重新读取仍需正确指导。
 
 ### 5.5 三个编号互不替代
 
 | 编号 | 标识对象 | 初始化/恢复 |
 | --- | --- | --- |
-| executor_seq | Executor 历史事件与 turn | 新请求从初始值开始，不是完整会话恢复 |
+| executor_seq | Executor 历史事件与 turn | 按当前 chat 全部角色日志最大 seq 继续 |
 | supervisor_seq | Supervisor 历史事件与 turn | 按当前 chat 已有历史最大 seq 继续 |
 | tool_result_seq | 原始工具事实 | 按同 session 原始结果最大编号继续 |
 
@@ -177,29 +181,18 @@ TaskOutcome 字段有独立可配置长度校验：
 
 ## 7. 上下文预算
 
-以下窗口常量不是对所有消息合计进行严格 token 限制的统一管理器：
+新增 AgentLoop/context_compression.py：在两角色异步调用点准备完整消息的副本，不修改原始事实。删除提前裁剪第 10/第 6 条历史、16000 query 和12000 observation 的旧路径；用户要求与完整 skill 规则不盲目压缩。
 
-| 内容 | 字符预算/行为 |
-| --- | --- |
-| 总模型上下文目标常量 | 80000，不是每次请求严格总上限 |
-| 用户 query 上下文视图 | 16000 |
-| 部分 description 上下文视图 | 6000，不是保存字段长度校验 |
-| 工具 observation | 12000，必要时保留头尾并标记省略 |
-| 最终汇总的 Supervisor description 历史 | 30000 目标，按完整条目选择 |
-| 任务摘要读取 | 12000 目标；当前 task 整条记录优先保留 |
-| 验收/决策历史查询窗口 | 最近 6 次局部查询 observation |
+- summarize 只有材料字符数严格大于 context_trigger_chars（默认 60000）才调用无工具模型；目标 context_summary_max_chars 默认 6000。
+- truncate 是独立显式策略，不调用模型。总结失败/超长最多重试两次，然后标明 fallback 截断与原始 locator；不伪装成功摘要。
+- 超大材料按请求预算分块，每个原文字符按原顺序进入摘要输入，不在摘要前删除中间正文。
+- 工具身份、状态、error/message、路径、分页、参数和 locator 作为确定性 source_facts 保留；正文的压缩不能改变验收控制字段。
+- 内容、目标、分支、阈值、输入/输出限制共同确定缓存键；回退新分支清空缓存。
+- 摘要调用使用已有适配器，计入模型请求预算和 token；不会递归进入 prepare_request。
+- 组装后整个 messages + tools JSON 严格校验 context_max_chars（默认 80000）；包括压缩请求。无法在保留要求/规则的情况下满足预算时明确 blocked，不用低阈值额外摘要掩盖。
+- 这是字符预算，不是模型 token 上下文窗口保证。大量不压缩的元数据、单独超大 query/规则仍可能 blocked。
 
-完整结果保存与模型可见正文不同。原始结果不自动灌入下一轮；定位后读取也可能受 observation 窗口限制。Executor 最近 description 使用有界窗口。
-
-决策消息默认明确区分：
-
-- 本轮最新 Executor output、完成状态、tool_summaries 与 locators；
-- 本轮 Supervisor evaluation、通过状态、拒绝或错误原因；
-- 历史辅助摘要的可用性和读取状态，而非自动加载全文；
-- 当前/已完成 TaskOutcome、锁定条件及现有成果字段；
-- 模型主动查询后的局部 memory_query_results。
-
-最新有效证据优先于旧摘要，但 Executor 自述不是验证证据。新失败/回归应修正旧结论；本轮未涉及的旧有效成果不自动失效。
+decision 继续区分本轮 Executor output/工具证据、本轮 Supervisor evaluation、历史辅助摘要可用性、TaskOutcome 和已查询 memory_query_results。task_summary.md 仍由模型按需查询，不自动灌入全部历史。本轮有效证据优先，Executor 自述不等于验收。
 
 ## 8. 历史保存格式
 
@@ -265,7 +258,7 @@ save_tool_result.py 定义 ToolResultRecord、ToolResultLocator、ToolSummary。
 
 write_in 是覆盖写：同目录临时文件 + flush/fsync + os.replace。因此采用“读取旧内容并拼接后原子替换”保留旧记录，不另建写入机制。内部 trusted_roots 限定摘要目录，不暴露为模型 MCP 参数。
 
-同 task_id/seq 标记避免正常重试重复追加。写入失败进入既有错误处理，不声称保存成功、不推进 task；此前内存更新和 decision JSONL 不会自动事务回滚。同 chat 并发摘要拼接尚无独占读改写锁。
+同 task_id/seq 标记避免正常重试重复追加。写入失败进入既有错误处理，不声称保存成功、不推进 task；此前内存更新和 decision JSONL 不会自动事务回滚。CLI 在整个执行期间持有 session 单写者锁，串行保护摘要读改写与编号；直接调用旧 main 接口不自动取得 CLI 单写者锁。
 
 ## 9. 当前记忆查询能力
 
@@ -291,7 +284,7 @@ read_task_summary 的模型 schema 不暴露 session_address/chat_id，只选择
 
 evaluation 记忆 skill 优先用 Executor 当前反馈；不足时读取当前 description、之前 task，再按需核查原始结果。错误判断先看当前错误与实际证据，不凭旧“已完成”摘要通过验收。
 
-evaluation 和 decision 支持多次模型请求依次查询多个结果，每次一个工具，不是每阶段只能核查一个。查询观察保留局部有界窗口，相同查询去重。旧内联记录仍可经旧读取路径查看，新格式通过 read_tool_result 显式取正文，不自动展开全部 JSONL。
+evaluation 和 decision 支持多次模型请求依次查询多个结果，每次一个工具，不是每阶段只能核查一个。查询观察在高阈值压缩前保留全部条目，相同查询去重；checkpoint 只保存查询动作/locator，恢复时从原始记录或分支内历史视图重建，不复制返回正文。旧内联记录仍可经旧读取路径查看，新格式通过 read_tool_result 显式取正文，不自动展开全部 JSONL。
 
 ## 10. MCP 与权限
 
@@ -307,31 +300,31 @@ read_all_files_tool、read_files_content_tool、sort_files_by_suffix_tool。
 
 ### Executor 私有
 
-Java/Spring 检查与运行、文件写入/替换、Python 查找/运行/安装、信息收集，以及动态发现的 GitHub/Browser/Docker 工具。
+Java/Spring 检查与运行、文件写入/替换、Python 查找/运行/安装、信息收集，以及动态发现且可信配置明确 capability、经 Host 授权放行的 GitHub/Browser/Docker 工具。
 
 必需 MCP 为 memory、supervisor_memory、system、collect，启动失败阻塞请求。GitHub、Browser、Docker 为可选，配置或启动失败可跳过。Python 子进程使用 sys.executable。
 
-工具角色权限不等于操作系统级执行隔离，不能与安全 sandbox 混为一谈。
+工具角色权限仍为第一层；新增 ExecutionGateway/SandboxPolicy 检查文件、网络和副作用，SandboxRunner 通过真实 Docker 隔离用户进程。未知外部 MCP capability 默认拒绝。
 
 ## 11. 当前文件读取设计
 
 ### read_all_files_tool
 
-单层目录浏览，不递归、不读正文；返回 directories/files 元数据、紧凑 tree 和分页游标，单次最多 200 项。查看子目录需再调用其 address。
+单层目录浏览，不递归、不读正文；返回 directories/files 元数据、紧凑 tree 和分页游标，底层最多 200 项；实际 MCP wrapper 固定每页 50 项。查看子目录需再调用其 address。
 
 ### read_files_content_tool
 
-精确文件按字符偏移读取，单页最多 20000 字符，通过 next_start_char 续读。目录只读直接文件、不递归，每页最多 50 文件，总正文预算最多 12000 字符，单文件预览最多 8000 字符。环境文件、当前排除的 JSON 和常见二进制/归档不返回正文。
+底层精确文件支持字符偏移、最多 20000 字符；实际 MCP wrapper 固定每次8000字符，不新增分页参数，通过 next_start_char 续读。目录只读直接文件、不递归，每页最多 50 文件，总正文预算最多 12000 字符，单文件预览最多 8000 字符。环境文件、当前排除的 JSON 和常见二进制/归档不返回正文。
 
 ### sort_files_by_suffix_tool
 
-接收 files 元数据并按 suffix 分类。不要假定存在已删除的 sort_files_by_mother_tool。
+底层接收 files 元数据并按 suffix 分类；实际 MCP schema 接收 home_address，在可信层扫描后分类。不要假定存在已删除的 sort_files_by_mother_tool。
 
 ## 12. Java 与 Python 工具
 
 judge_spring_project_tool 根据本地路径完整解析 POM，不以截断预览代替原文件；提取 Maven 坐标/父项目、Wrapper/版本要求、Java 声明、Spring Boot 版本来源、依赖、插件、模块与 profiles。不解析外部父 POM，也不执行构建。
 
-其他工具提供 JDK/Python 查找、代码运行、Spring Boot 打包/启动检查、依赖安装和文件操作。安装与打包 MCP 包装仍启用交互确认；stdio 下是否阻塞与用户授权边界不能视为已解决。
+其他工具提供 JDK/Python 查找、代码运行、Spring Boot 打包/启动检查、依赖安装和文件操作。安装与打包 MCP 包装均为 interactive=False，stdio 不读取 stdin；终端 Host 绑定实际不可变操作、会话/分支及策略版本完成单次授权，拒绝/非交互时不执行。受限执行使用容器可信 Python/JDK，所有原有 subprocess 调用已接统一执行层，无自动主机降级。
 
 当前 collect MCP 的 get_needed_info_tool 是信息收集占位响应，不应将旧 collect.py 辅助实现描述为已接入的真实信息获取能力。
 
@@ -351,27 +344,27 @@ INFORMATION.json 选择角色 provider、模型、温度、Java/Python 环境和
 
 ## 15. 已验证结果
 
-2026-10-01 使用指定解释器运行离线测试：
+最终原项目开启实际 Docker 后端后：87项全部通过，CLI --help 正常；下述默认跳过行为不影响单独实际验收结果。
 
-~~~powershell
-& "D:\anacode\python.exe" -c "import sys; print(sys.executable)"
-$env:PYTHONDONTWRITEBYTECODE = "1"
-& "D:\anacode\python.exe" -m unittest discover -s tests -v
-~~~
+2026-10-05 使用 D:\anacode\python.exe，在临时工作区运行 unittest discover：87 项，86 通过，1 项实际 Docker 测试需 opt-in 默认跳过。原有67项回归仍通过；新增去重、完整压缩输入/计费预算、连续问答、checkpoint补偿、恢复与回退、分支读取、单写者、权限和授权检查。
 
-共 67 项测试通过。覆盖结构化输出、协议多工具重选、单次执行与总结重试、独立原始结果/保存失败、权限与 Host 绑定、同 task 重入、证据复用、Supervisor 否决与推进、TaskOutcome、摘要累计/纠错/chat 隔离/追加去重/写入失败、按需摘要查询、description 超长不报错、成果字段超限重写、文件分页及大型 POM 解析。
+单独开启 CODING_AGENT_DOCKER_INTEGRATION=1、使用已有 nginx:alpine 镜像：test_sandbox.py 的5项全部通过，包含真实容器可写工作区、未挂载主机文件不可读写、伪测试 API key 不继承、只读失败、关闭网络、取消后自有容器清理。该镜像仅验证通用隔离后端，不证明 Python/JDK 工具链镜像可用。
 
-这是离线回归测试，不证明真实模型必定按提示词检索；未验证付费模型端到端、真实 GitHub/Docker/Playwright、实际构建或安装。本次架构记录更新不修改运行代码。
+专用 sandbox/Dockerfile 的镜像构建因 Docker Hub 连接超时失败；真实 Python/Java/Maven/Gradle 集成及依赖安装未运行。未使用付费模型/外部服务验收；模拟模型两轮端到端完成与 evaluation/decision 重新生成通过。Windows junction 需要系统创建权限的情况尚未专项验证。
+
+命令、覆盖边界与未验证项见 README.md。不要将这些测试解释为跨文件事务、任意代码绝对安全或真实模型摘要质量保证。
 
 ## 16. 当前优先级
 
-以下是已知限制与后续候选工作，不是自动执行指令：
+以下是已知边界，不是自动执行指令：
 
-1. 完整断点恢复未实现：编号恢复不等于恢复 task_list、Executor seq、handoff 和 TaskOutcome；复用旧 chat/task_id 需审查历史身份冲突。
-2. 原始结果追加有锁，但独立请求编号冲突只拒绝，未实现原子分配并重试；角色 JSONL 与摘要不是完整跨文件事务。
-3. 同 chat 摘要读改写缺少并发串行化；失败时 State/decision 历史可能已更新，单文件原子替换不是全流程原子提交。
-4. 历史读取主要为线性扫描；长会话读取开销、原始证据可见性和上下文总预算仍需关注。
-5. 自主检索与累计成果纠错依赖模型行为，需另行真实运行验收；不自动加入全部历史，也不假定历史查询以后完全不需要。
-6. 交互确认、真实执行隔离和凭据管理需独立评估，不能由现有单元测试宣称全部解决。
+1. 新增 State/session_checkpoint.py：typed dataclass 原子 checkpoint、session 单写者、统一 timeline event_seq、每边界前置 snapshot。CLI 恢复当前阶段，普通成功工具通过原始 locator 只重新总结；checkpoint 滞后时补齐已落盘事实。未知/中断操作不自动重放，需查看真实效果并选安全边界。
+2. 会话路径为 --state-dir 下的精确 session ID，chat/branch 分离。JSONL 保持原文件位置/旧字段，增加 request_id/branch_id/event_seq；tool_result_seq 按整个 session 继续，角色 seq 按 chat 继续，同 chat 新请求 task_id 接在旧任务后。
+3. /rewind 选择 event 或 task_start，创建有 parent/cutoff 的新分支。角色历史、原始事实读取、任务摘要、依赖成果与缓存遵守分支可见范围。原日志不修改，真实文件不回滚，无自动 Git reset。旧日志没有可靠前置 snapshot 时只允许查看，拒绝伪造精确恢复。
+4. 权限由当前 CLI 可信策略决定，不恢复旧 full-access 或批准。默认 workspace-write；read-only 禁止用户项目改写但 Host 可写专用状态；danger-full-access 必须用户显式选择并显示无进程隔离。工作区不得包含 Host 配置/状态后再挂入容器。
+5. Docker Desktop Linux 容器后端只挂选定工作区，不挂 Host 家目录/状态/密钥/socket；默认 network none、只读 rootfs、去 capabilities、资源限制。后端/镜像缺失明确拒绝，不自动拉镜像、不退回无隔离。额外 file roots 只支持可信文件工具，不自动作为容器 mounts；网络仅 on/off，不是域名过滤。配置 tool_capabilities 后外部 MCP 才可能启动/放行，仍不受本地容器自动约束。
+6. 现有 write_in 的原子覆盖机制继续保存 task_summary.md，checkpoint 复用其 _atomic_write。JSONL、timeline、checkpoint、Markdown 不构成跨文件原子事务；写盘失败时仍须调查最后持久化边界，不声称绝对 exactly-once。
+7. 静态路径检查不能抵御所有恶意并发替换 race；额外 Windows ACL/junction 专项、SDK 在途取消/计费、真实工具链与远端 MCP 的验收仍需单独验证。系统只清理自己创建的进程/容器。
+8. 历史扫描和 snapshot/cache 会随长会话增长，尚无索引/保留策略；不自动删除旧记录。摘要质量和证据冲突解释仍依赖真实模型行为。
 
-故障记录与复现线索见 PROBLEM.md；旧问题是否修复以当前源码及对应测试为准。
+故障复现保留在 PROBLEM.md；判断是否修复以当前源码与对应测试为准。

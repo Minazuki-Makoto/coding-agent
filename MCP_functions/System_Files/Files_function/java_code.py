@@ -2,6 +2,7 @@ import shutil
 from collections import deque
 from pathlib import Path
 import subprocess
+from MCP_functions.sandbox import execution_run, check_path
 import re
 import xml.etree.ElementTree as ET
 from .bfs_read import read_all_files,sort_files_by_suffix
@@ -36,7 +37,7 @@ def _maven_coordinate(node, properties):
 def _read_complete_build_file(file_record, expected_names, warnings):
     """Read a build file in full; directory-scan content is only a preview."""
     address = str(file_record.get("address") or file_record.get("file_name") or "")
-    path = Path(address)
+    path = check_path(address)
     if path.name not in expected_names or not path.is_file():
         content = file_record.get("content")
         if isinstance(content, str):
@@ -331,7 +332,7 @@ def find_java_exe(
         home_address: str = None
 ):
 
-    root = Path(home_address) if home_address else Path("C:/")
+    root = check_path(home_address or Path.cwd())
 
     if not root.is_dir():
 
@@ -349,7 +350,7 @@ def find_java_exe(
         current = directories.popleft()
 
         try:
-            resolved = current.resolve()
+            resolved = check_path(current)
 
             if resolved in visited:
 
@@ -366,14 +367,14 @@ def find_java_exe(
                 version = ""
                 for executable in (java_path, javac_path):
                     try:
-                        result = subprocess.run(
+                        result = execution_run(
                             [str(executable), "-version"],
                             stdin=subprocess.DEVNULL,
                             capture_output=True,
                             text=True,
                             errors="replace",
                             timeout=3,
-                            creationflags=subprocess.CREATE_NO_WINDOW
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                         )
 
                         if result.returncode != 0:
@@ -401,6 +402,10 @@ def find_java_exe(
 
             for subpath in current.iterdir():
                 if subpath.is_dir():
+                    try:
+                        check_path(subpath)
+                    except PermissionError:
+                        continue
                     directories.append(subpath)
         except (OSError, RuntimeError):
             # 无权限、路径失效或链接解析失败时，跳过该目录。
@@ -422,8 +427,8 @@ def run_java_get_feedback(
         code_address:str,
         jdk_location:str,
 ):
-    code_address = Path(code_address).resolve()
-    jdk_location = Path(jdk_location).resolve()
+    code_address = check_path(code_address)
+    jdk_location = check_path(jdk_location)
 
     if not code_address.is_file() or code_address.suffix != ".java":
         return {
@@ -450,7 +455,7 @@ def run_java_get_feedback(
         }
 
     try:
-        result = subprocess.run(
+        result = execution_run(
             [
                 str(javac_location),
                 "-cp",
@@ -462,7 +467,7 @@ def run_java_get_feedback(
             errors="replace",
             cwd=str(code_address.parent),
             timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
 
 
@@ -475,14 +480,14 @@ def run_java_get_feedback(
                 "returncode": result.returncode
             }
 
-        result = subprocess.run(
+        result = execution_run(
             [str(java_location), "-cp", str(code_address.parent), java_class_name],
             capture_output=True,
             text=True,
             errors="replace",
             cwd=str(code_address.parent),
             timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
 
         return {
@@ -496,7 +501,7 @@ def run_java_get_feedback(
     except subprocess.TimeoutExpired:
 
         return {
-            "status": "error",
+            "status": "unknown",
             "message": "java compilation or execution timed out after 10 seconds"
         }
 
@@ -591,7 +596,7 @@ def package_spring_boot(
                     "-DskipTests"
                 ]
 
-            result = subprocess.run(
+            result = execution_run(
                 command,
                 cwd=str(project_path),
                 capture_output=True,
@@ -657,7 +662,7 @@ def package_spring_boot(
                     "bootJar"
                 ]
 
-            result = subprocess.run(
+            result = execution_run(
                 command,
                 cwd=str(project_path),
                 capture_output=True,
@@ -743,7 +748,7 @@ def package_spring_boot(
 
     except subprocess.TimeoutExpired:
         return {
-            "status": "error",
+            "status": "unknown",
             "message":
                 "spring boot packaging timed out"
         }
@@ -843,7 +848,7 @@ def check_spring_boot_startup(
         }
 
     try:
-        result = subprocess.run(
+        result = execution_run(
             [
                 str(java_path),
                 "-jar",
@@ -903,7 +908,7 @@ def check_spring_boot_startup(
             or "UnsatisfiedDependencyException" in logs
         ):
             return {
-                "status": "error",
+                "status": "unknown",
                 "message":
                     "spring boot startup failed",
                 "logs": logs

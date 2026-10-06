@@ -115,6 +115,8 @@ def save_supervisor_state_history(current_state, record_type: str = "supervisor_
         "validation_error": _value(current_state, "validation_error", ""),
         "exit_reason": _value(current_state, "exit_reason", ""),
         }
+    from State.session_checkpoint import annotate_record
+    annotate_record(record, "supervisor_history.jsonl")
     with (session_address / "supervisor_history.jsonl").open(
         "a", encoding="utf-8"
     ) as history_file:

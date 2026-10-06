@@ -1,3 +1,4 @@
+from State.session_checkpoint import record_visible
 import json
 from pathlib import Path
 
@@ -23,6 +24,8 @@ def read_supervisor_history(
             if not line.strip():
                 continue
             record = json.loads(line)
+            if not record_visible(record):
+                continue
             if not isinstance(record, dict):
                 continue
             if record.get("chat_id") != chat_id:

@@ -1,3 +1,4 @@
+from State.session_checkpoint import record_visible
 import json
 import sys
 from pathlib import Path
@@ -70,6 +71,10 @@ def read_history_by_seq(
                 continue
 
             history = json.loads(line)
+
+            if not record_visible(history):
+
+                continue
             if not isinstance(history,dict):
                 continue
 

@@ -1,3 +1,4 @@
+from State.session_checkpoint import record_visible
 import json
 
 
@@ -18,6 +19,8 @@ def read_memory_state(path, chat_id):
             if not line.strip():
                 continue
             record = json.loads(line)
+            if not record_visible(record):
+                continue
             if not isinstance(record, dict) or record.get("chat_id") != chat_id:
                 continue
             record_type = record.get("record_type")

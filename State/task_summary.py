@@ -52,6 +52,13 @@ def read_task_summary_context(
         end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
         task_id = int(match.group("task_id"))
         supervisor_seq = int(match.group("seq"))
+        from State.session_checkpoint import record_visible
+        body = content[start:end].strip()
+        branch_marker = re.search(r"<!-- branch_id=(\S+) event_seq=(\d+) -->", body)
+        identity = ({"branch_id": branch_marker.group(1), "event_seq": int(branch_marker.group(2)),
+                     "chat_id": str(chat_id)} if branch_marker else {"chat_id": str(chat_id)})
+        if not record_visible(identity):
+            continue
         latest_by_task[task_id] = {
             "task_id": task_id,
             "supervisor_seq": supervisor_seq,
@@ -161,6 +168,11 @@ def append_task_summary_record(
             "file_address": str(path),
             "changed": False,
         }
+    from State.session_checkpoint import active_run
+    run = active_run()
+    if run:
+        event = run.emit("task_summary", "supervisor", task_id=task_id, supervisor_seq=supervisor_seq)
+        record = record.replace(marker, marker + f"\n<!-- branch_id={run.branch} event_seq={event['event_seq']} -->", 1)
     updated = f"{existing.rstrip()}\n\n{record.strip()}\n" if existing else f"{record.strip()}\n"
     result = write_in(
         str(path),

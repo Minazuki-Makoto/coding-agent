@@ -113,10 +113,12 @@ class ToolRegistry:
             permissions:dict[str,set[AgentRole]] | None = None,
             client_default_permissions:dict[str,set[AgentRole]] | None = None,
             context_provider=None,
+            execution_gateway=None,
     ):
         self.host = host
         self.permissions = permissions or build_default_tool_permissions()
         self.context_provider = context_provider
+        self.execution_gateway = execution_gateway
 
         # 外部 MCP 的工具名称是动态发现的，按服务分配给 executor。
         self.client_default_permissions = client_default_permissions or {
@@ -262,6 +264,28 @@ class ToolRegistry:
                 message=f"{role.value} is not allowed to call {tool_name}"
             )
 
+        from State.session_checkpoint import active_run
+        run = active_run()
+        if tool_name in SUPERVISOR_ONLY_TOOLS and run:
+            # In-process Host binding enforces branch visibility; no mutable model branch input.
+            from Context import mcp_resources, mcp_supervisor_tools
+            function = getattr(mcp_resources, tool_name, None) or getattr(mcp_supervisor_tools, tool_name)
+            output = await function(**arguments)
+            return ToolExecutionResult(tool_name, "host_history", True, None, "", output)
+        if self.execution_gateway is not None:
+            if run and role == AgentRole.SUPERVISOR:
+                import uuid
+                run.current_operation = uuid.uuid4().hex
+                run.emit("tool_intent", "supervisor", operation_id=run.current_operation,
+                         tool_name=tool_name, arguments=dict(arguments), status="started")
+            async def raw_call():
+                client = self.host.session_dictionary.get(client_name)
+                if client is None:
+                    return self._error(tool_name, "client_unavailable", "MCP client unavailable", client_name)
+                raw = await client.call_tool(tool_name=tool_name, argument=arguments)
+                return self._normalize_result(tool_name, client_name, raw)
+            return await self.execution_gateway.call(tool_name, arguments, raw_call)
+
         client = self.host.session_dictionary.get(client_name)
         if client is None:
             return self._error(
@@ -303,6 +327,7 @@ class ToolRegistry:
         if not isinstance(chat_id, str) or not chat_id:
             raise ValueError("host chat_id is unavailable")
         bound = dict(arguments)
+        bound.pop("branch_id", None)
         bound["session_address"] = session_address
         bound["chat_id"] = chat_id
         if "task_id" in bound:
@@ -340,7 +365,7 @@ class ToolRegistry:
         business_error = (
             isinstance(output,dict)
             and str(output.get("status","")).lower()
-            in {"error","failed","failure"}
+            in {"error","failed","failure","confirmation_required","cancelled","denied","unknown","interrupted"}
         )
 
         ok = not protocol_error and not business_error

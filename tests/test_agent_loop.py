@@ -680,7 +680,7 @@ class ExecutorLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(registry.calls, [])
             self.assertEqual(executor.exit_reason, "executor_repeated_completed_call")
 
-    async def test_plain_json_and_window_are_bounded(self):
+    async def test_plain_json_preserves_history_before_high_threshold_compression(self):
         with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as directory:
             agent, supervisor, executor, _ = make_states(directory, max_steps=11)
             chat = QueueChat(
@@ -706,8 +706,8 @@ class ExecutorLoopTests(unittest.IsolatedAsyncioTestCase):
                 supervisor,
                 executor,
             )
-            self.assertEqual(len(executor.memory_window), 10)
-            self.assertNotIn("description-0", executor.memory_window)
+            self.assertEqual(len(executor.memory_window), 11)
+            self.assertIn("description-0", executor.memory_window)
             self.assertTrue(executor.is_finished)
 
     async def test_tool_failure_is_saved_and_step_limit_one_exits(self):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import asyncio
 import json
 import os
 import sys
@@ -185,13 +186,13 @@ class SupervisorDescriptionHistory:
     def to_dicts(self):
         return [entry.to_dict() for entry in self.entries]
 
-    def model_context(self, max_chars: int = 30000):
+    def model_context(self, max_chars: int | None = None):
         selected = []
         used = 0
         for entry in reversed(self.entries):
             item = entry.to_dict()
             size = len(json.dumps(item, ensure_ascii=False))
-            if selected and used + size > max_chars:
+            if max_chars is not None and selected and used + size > max_chars:
                 break
             selected.append(item)
             used += size
@@ -372,6 +373,14 @@ class AgentState:
     task_outcomes: dict[int, TaskOutcome] = field(default_factory=dict)
     task_cumulative_summaries: dict[int, str] = field(default_factory=dict)
     task_summary_saved_seqs: set[int] = field(default_factory=set)
+    branch_id: str = "main"
+    request_id: str = ""
+    context_trigger_chars: int = 60000
+    context_summary_max_chars: int = 6000
+    context_max_chars: int = 80000
+    compression_cache: dict = field(default_factory=dict)
+    conversation_context: list[dict] = field(default_factory=list)
+    request_start_task_id: int = 0
 
 state = AgentState
 
@@ -388,6 +397,7 @@ class RuntimeConfig:
     java: dict[str, Any] | None
     python: dict[str, Any] | None
     writable_roots: tuple[str, ...] = ()
+    tool_capabilities: dict[str, list[str]] = field(default_factory=dict)
 
 
 def load_runtime_config(path: Path = INFORMATION_PATH) -> RuntimeConfig:
@@ -420,12 +430,13 @@ def load_runtime_config(path: Path = INFORMATION_PATH) -> RuntimeConfig:
         writable_roots=tuple(
             str(item) for item in (infos.get("writable_roots") or []) if item
         ),
+        tool_capabilities=infos.get("tool_capabilities") or {},
     )
 
 
 def state_init(session_address, chat_id, query="", config=None):
     config = config or load_runtime_config()
-    return AgentState(
+    result = AgentState(
         session_address=str(session_address),
         chat_id=str(chat_id),
         user_query=query,
@@ -436,6 +447,10 @@ def state_init(session_address, chat_id, query="", config=None):
         java=config.java,
         python=config.python,
     )
+    from State.session_checkpoint import rows
+    result.executor_seq = max((row.get("seq", 0) for row in rows(Path(session_address) / "executor_history.jsonl")
+                               if row.get("chat_id") == str(chat_id)), default=0)
+    return result
 
 
 async def _run_main(
@@ -443,8 +458,9 @@ async def _run_main(
     session_address: str,
     chat_id: str,
     started_at: datetime,
+    *, session_run=None, runtime_config=None, sandbox_policy=None, approval=None,
 ):
-    config = load_runtime_config()
+    config = runtime_config or load_runtime_config()
     now_state = state_init(session_address, chat_id, query, config)
     now_state.tool_result_seq = load_last_tool_result_seq(
         now_state.session_address, now_state.chat_id
@@ -456,6 +472,25 @@ async def _run_main(
     executor_state = ExecutorState(
         session_address=now_state.session_address, chat_id=now_state.chat_id
     )
+    from State.session_checkpoint import ACTIVE_RUN, boundary
+    if session_run:
+        if session_run.bundle:
+            now_state = session_run.bundle["agent"]
+            supervisor_state = session_run.bundle["supervisor"]
+            executor_state = session_run.bundle["executor"]
+            evaluation_state = session_run.bundle["evaluation"]
+        else:
+            session_run.bundle = {"agent": now_state, "supervisor": supervisor_state,
+                                  "executor": executor_state, "evaluation": evaluation_state}
+        now_state.branch_id = session_run.branch
+        ACTIVE_RUN.set(session_run)
+    now_state.tool_result_seq = max(now_state.tool_result_seq,
+        load_last_tool_result_seq(now_state.session_address, now_state.chat_id))
+    from MCP_functions.sandbox import SandboxPolicy
+    from MCP_functions.execution_gateway import ExecutionGateway
+    sandbox_policy = sandbox_policy or SandboxPolicy(str(Path.cwd()), str(Path(session_address).resolve()),
+        mode="read-only", protected_paths=(str(INFORMATION_PATH),))
+    gateway = ExecutionGateway(sandbox_policy, approve=approval, capabilities=config.tool_capabilities)
     supervisor_client = None
     executor_client = None
     status = "blocked"
@@ -465,9 +500,11 @@ async def _run_main(
 
     async with AsyncExitStack() as stack:
         host = mcp_host(stack)
-        await _register_mcp_clients(host, config.writable_roots)
+        await _register_mcp_clients(host, config.writable_roots, sandbox_policy=sandbox_policy,
+                                    allow_external=bool(config.tool_capabilities))
         registry = ToolRegistry(
             host,
+            execution_gateway=gateway,
             context_provider=lambda: {
                 "session_address": now_state.session_address,
                 "chat_id": now_state.chat_id,
@@ -483,7 +520,18 @@ async def _run_main(
         chat_functions = _chat_map()
 
         try:
-            await supervisor_making_plan(
+            if session_run and session_run.resume and session_run.phase == "planning_tool_summary":
+                from AgentLoop.supervisor_loop import resume_supervisor_tool_summary
+                await resume_supervisor_tool_summary(now_state, supervisor_state, evaluation_state, executor_state,
+                    config.supervisor, supervisor_client, chat_functions[config.supervisor])
+            elif session_run and session_run.resume and session_run.phase == "initial_guidance":
+                from AgentLoop.supervisor_loop import _prepare_initial_guidance
+                await _prepare_initial_guidance(now_state, supervisor_state, chat_functions[config.supervisor],
+                                                 supervisor_client, config.supervisor)
+                session_run.resume = False
+            elif not (session_run and session_run.resume and now_state.task_list):
+                boundary("planning", "supervisor")
+                await supervisor_making_plan(
                 query,
                 now_state,
                 chat_functions[config.supervisor],
@@ -501,14 +549,18 @@ async def _run_main(
             """)
 
             while now_state.now_task_id < len(now_state.task_list):
-                if now_state.task_attempt >= now_state.max_task_attempts:
+                phase = session_run.phase if session_run and session_run.resume else "executor_start"
+                if phase in {"executor_start", "task_start"} and now_state.task_attempt >= now_state.max_task_attempts:
                     block_reason = (
                         f"task {now_state.now_task_id} exceeded "
                         f"{now_state.max_task_attempts} attempts"
                     )
                     break
-                now_state.task_attempt += 1
-                await run_executor_loop(
+                if phase not in {"evaluation", "decision", "decision_tool_summary", "task_advance"}:
+                    if phase not in {"executor_action", "executor_tool_summary"}:
+                        boundary("task_start", "host")
+                        now_state.task_attempt += 1
+                    await run_executor_loop(
                     now_state,
                     config.executor,
                     executor_client,
@@ -519,7 +571,15 @@ async def _run_main(
                     supervisor_state,
                     executor_state,
                 )
-                decision = await run_supervisor_loop(
+                    boundary("evaluation", "supervisor")
+                    if executor_state.exit_reason == "executor_operation_unknown":
+                        block_reason = "unknown operation: inspect real effects before selecting a new boundary"
+                        break
+                if phase == "task_advance":
+                    from AgentLoop.supervisor_loop import SupervisorDecisionResult
+                    decision = SupervisorDecisionResult.model_validate(session_run.payload["decision"])
+                else:
+                    decision = await run_supervisor_loop(
                     now_state,
                     config.supervisor,
                     supervisor_client,
@@ -534,6 +594,7 @@ async def _run_main(
                 if supervisor_state.proposed_task_list is not None:
                     now_state.task_list = list(supervisor_state.proposed_task_list)
                 if decision.is_next_target:
+                    boundary("task_advance", "host", decision=decision.model_dump())
                     now_state.now_task_id += 1
                     now_state.task_attempt = 0
                     if now_state.now_task_id >= len(now_state.task_list):
@@ -569,16 +630,26 @@ async def _run_main(
                     )
                     now_state.task_handoffs[now_state.now_task_id] = handoff
                     supervisor_state.handoff = handoff
+                    if session_run:
+                        session_run.resume = False
+                    boundary("task_start", "host")
                 elif supervisor_state.exit_reason:
                     block_reason = supervisor_state.exit_reason
                     break
             else:
                 status = "completed"
                 answer = supervisor_state.final_answer or executor_state.output_content
+        except asyncio.CancelledError:
+            from MCP_functions.sandbox import cancel_all
+            await asyncio.to_thread(cancel_all)
+            if session_run:
+                session_run.emit("interrupted", "host", status="interrupted")
+                session_run.checkpoint("interrupted")
+            raise
         except Exception as exc:
             block_reason = str(exc)
         finally:
-            if now_state.supervisor_descriptions.entries:
+            if now_state.supervisor_descriptions.entries and not asyncio.current_task().cancelling():
                 try:
                     chat_description = await summarize_supervisor_descriptions(
                         now_state=now_state,
@@ -608,6 +679,12 @@ async def _run_main(
                 else "未能生成有效计划。"
             )
         )
+
+    if session_run:
+        session_run.phase = "completed" if status == "completed" else session_run.phase
+        session_run.emit("answer", "host", status=status, answer=answer,
+                         total_tokens=now_state.total_token, model_requests=now_state.model_request_count)
+        session_run.checkpoint(status)
 
     finished_at = datetime.now()
     elapsed_time_seconds = round((finished_at - started_at).total_seconds(), 3)
@@ -650,25 +727,35 @@ async def _run_main(
     }
 
 
-async def main(query: str, session_address: str, chat_id: str):
+async def main(query: str, session_address: str, chat_id: str, *, session_run=None,
+               runtime_config=None, sandbox_policy=None, approval=None):
     """Convert startup failures into a saved blocked result."""
     started_at = datetime.now()
+    from State.session_checkpoint import ACTIVE_RUN
+    token = ACTIVE_RUN.set(session_run)
     try:
-        result = await _run_main(query, session_address, chat_id, started_at)
+        if session_run or runtime_config or sandbox_policy:
+            result = await _run_main(query, session_address, chat_id, started_at,
+                session_run=session_run, runtime_config=runtime_config,
+                sandbox_policy=sandbox_policy, approval=approval)
+        else:
+            result = await _run_main(query, session_address, chat_id, started_at)
 
     except Exception as exc:
         finished_at = datetime.now()
         elapsed_time_seconds = round((finished_at - started_at).total_seconds(), 3)
         answer = f"任务未完成。启动或连接阶段失败：{exc}"
+        preserved = session_run.bundle["agent"] if session_run and session_run.bundle else None
+        preserved_tokens = preserved.total_token if preserved else 0
         save_chat_history(
             chat_id=str(chat_id),
             session_address=str(session_address),
             query_content=query,
             answer_content=answer,
             description=str(exc),
-            task_number=0,
-            seq_number=0,
-            total_tokens=0,
+            task_number=len(preserved.task_list) if preserved else 0,
+            seq_number=max(preserved.executor_seq, preserved.supervisor_seq) if preserved else 0,
+            total_tokens=preserved_tokens,
             elapsed_time_seconds=elapsed_time_seconds,
             started_at=started_at.isoformat(timespec="seconds"),
             finished_at=finished_at.isoformat(timespec="seconds"),
@@ -676,14 +763,20 @@ async def main(query: str, session_address: str, chat_id: str):
         result = {
             "status": "blocked",
             "answer": answer,
-            "completed_tasks": 0,
-            "task_list": [],
+            "completed_tasks": preserved.now_task_id if preserved else 0,
+            "task_list": list(preserved.task_list) if preserved else [],
             "block_reason": str(exc),
-            "total_tokens": 0,
+            "total_tokens": preserved_tokens,
             "started_at": started_at.isoformat(timespec="seconds"),
             "finished_at": finished_at.isoformat(timespec="seconds"),
             "elapsed_time_seconds": elapsed_time_seconds,
         }
+        if session_run:
+            session_run.emit("answer", "supervisor", status="blocked", answer=answer,
+                             total_tokens=preserved_tokens, block_reason=str(exc))
+            session_run.checkpoint("blocked")
+    finally:
+        ACTIVE_RUN.reset(token)
     print(
         f"Total tokens: {result['total_tokens']}, "
         f"elapsed time: {result['elapsed_time_seconds']} seconds"
@@ -691,7 +784,13 @@ async def main(query: str, session_address: str, chat_id: str):
     return result
 
 
-async def _register_mcp_clients(host, writable_roots: tuple[str, ...] = ()):
+async def _register_mcp_clients(host, writable_roots: tuple[str, ...] = (), *, sandbox_policy=None, allow_external=False):
+    from dataclasses import asdict
+    base_environment = {key: value for key, value in os.environ.items()
+                        if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"}}
+    base_environment["PYTHONIOENCODING"] = "utf-8"
+    if sandbox_policy:
+        base_environment["CODING_AGENT_SANDBOX_POLICY"] = json.dumps(asdict(sandbox_policy))
     required_parameters = {
         "memory": StdioServerParameters(
             command=sys.executable,
@@ -708,7 +807,7 @@ async def _register_mcp_clients(host, writable_roots: tuple[str, ...] = ()):
             args=["-m", "MCP_functions.System_Files.Files_server.mcp_system_server"],
             cwd=str(PROJECT_ROOT),
             env={
-                **os.environ,
+                **base_environment,
                 "CODING_AGENT_WRITABLE_ROOTS": os.pathsep.join(writable_roots),
             },
         ),
@@ -719,7 +818,13 @@ async def _register_mcp_clients(host, writable_roots: tuple[str, ...] = ()):
         ),
     }
     for client_name, parameters in required_parameters.items():
+        if parameters.env is None:
+            parameters.env = dict(base_environment)
         await host.run(parameters, client_name)
+    from State.session_checkpoint import active_run
+    # Restricted CLI does not spawn optional external executables as a side door.
+    if not allow_external:
+        return
     try:
         optional_parameters = get_remote_mcp_link()
     except Exception:

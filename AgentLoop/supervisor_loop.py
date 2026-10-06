@@ -304,10 +304,11 @@ async def supervisor_making_plan(
     supervisor_state.memory_window = []
 
     information = {
-        "user_query": bounded_text(query, USER_QUERY_MAX_CHARS),
+        "user_query": query,
         "session_address": now_state.session_address,
         "chat_id": now_state.chat_id,
         "executor_tools": _tool_catalog(executor_tools or []),
+        "conversation_context": now_state.conversation_context,
         "skill_info": _skill_catalog(skill_lists or []),
     }
 
@@ -367,6 +368,10 @@ async def supervisor_making_plan(
                 supervisor, response.get("message"), call, tool_result
             )
         )
+        from State.session_checkpoint import boundary
+        boundary("planning_tool_summary", "supervisor", tool_name=call.name, arguments=call.arguments,
+                 response_message=response.get("message"), tool_result_seq=(
+                     supervisor_state.last_tool_result_ref.tool_result_seq if call.name not in SUPERVISOR_ONLY_TOOLS and supervisor_state.last_tool_result_ref else None))
         summary, result = await _validated_tool_summary(
             now_state, chat_function, client, supervisor, messages,
             PlanningResult, supervisor_state, "planning_summary"
@@ -403,7 +408,19 @@ async def run_supervisor_loop(
     supervisor_evaluation_state: SupervisorEvaluationState,
     executor_state: ExecutorState,
 ):
-    _reset_supervisor_turn(now_state, supervisor_state, supervisor_evaluation_state)
+    from State.session_checkpoint import active_run, boundary
+    run = active_run()
+    if run and run.resume and run.phase == "decision_tool_summary":
+        restored = await resume_supervisor_tool_summary(now_state, supervisor_state, supervisor_evaluation_state,
+            executor_state, supervisor, supervisor_client, chat_function)
+        if restored.is_finished:
+            return restored
+        boundary("decision", "supervisor", rounds=1, queries=[])
+        return await making_next_plan_loop(now_state, supervisor, supervisor_client, chat_function,
+            supervisor_tools, tool_registry, supervisor_state, supervisor_evaluation_state, executor_state)
+    resume_decision = bool(run and run.resume and run.phase in {"decision", "decision_tool_summary"})
+    if not (run and run.resume):
+        _reset_supervisor_turn(now_state, supervisor_state, supervisor_evaluation_state)
     supervisor_state.reviewed_executor_seqs = [
         *executor_state.tool_event_seqs,
         *(
@@ -412,7 +429,8 @@ async def run_supervisor_loop(
             else []
         ),
     ]
-    evaluation = await evaluation_loop(
+    if not resume_decision:
+        evaluation = await evaluation_loop(
         now_state,
         supervisor,
         supervisor_client,
@@ -424,7 +442,7 @@ async def run_supervisor_loop(
         supervisor_evaluation_state,
         executor_state,
     )
-    save_executor_review(
+        save_executor_review(
         supervisor_state,
         list(executor_state.tool_event_seqs),
         executor_state.executor_turn_seq,
@@ -463,12 +481,12 @@ async def evaluation_loop(
     selected_skill = _find_supervisor_skill(
         skill_lists, MEMORY_RETRIEVAL_SKILL_NAME
     )
-    memory_query_results = []
-    queried_memory_calls = set()
+    memory_query_results, queried_memory_calls, rounds = await _restore_stage_queries(now_state, "evaluation")
 
     print("================进入supervisor_evaluation阶段=================")
-    rounds = 0
     while rounds < now_state.max_supervision_times:
+        from State.session_checkpoint import boundary
+        boundary("evaluation", "supervisor", rounds=rounds, queries=_query_descriptors(memory_query_results))
         print(f"\n\n第{rounds + 1}轮")
         messages = _build_supervisor_evaluation_message(
             executor_state,
@@ -548,7 +566,6 @@ async def evaluation_loop(
                     supervisor_state.last_tool_result_ref,
                 )
             )
-            del memory_query_results[:-6]
             _evaluation_memory(
                 supervisor_evaluation_state,
                 (
@@ -600,10 +617,10 @@ async def making_next_plan_loop(
 ):
 
     print("===============进入supervisor_making_decision阶段======================")
-    memory_query_results = []
-    queried_memory_calls = set()
-    rounds = 0
+    memory_query_results, queried_memory_calls, rounds = await _restore_stage_queries(now_state, "decision")
     while rounds < now_state.max_supervision_times:
+        from State.session_checkpoint import boundary
+        boundary("decision", "supervisor", rounds=rounds, queries=_query_descriptors(memory_query_results))
 
         print(f"\n\n第{rounds + 1}轮")
         messages = _build_decision_message(
@@ -635,7 +652,6 @@ async def making_next_plan_loop(
             supervisor_state.memory_window.append(
                 _multiple_tool_call_feedback(calls)
             )
-            del supervisor_state.memory_window[:-10]
             continue
         rounds += 1
         if not calls:
@@ -656,7 +672,6 @@ async def making_next_plan_loop(
                     f"同一历史查询已执行：{call.name}。请使用 memory_query_results 中的结果；"
                     "若仍无准确把握，缩小缺口后选择其他 task 或证据 locator，不重复同一查询。"
                 )
-                del supervisor_state.memory_window[:-10]
                 continue
             tool_result = await tool_registry.call(
                 AgentRole.SUPERVISOR, call.name, call.arguments
@@ -675,7 +690,6 @@ async def making_next_plan_loop(
                 memory_query_results.append(
                     _memory_query_observation(call.name, call.arguments, tool_result)
                 )
-                del memory_query_results[:-6]
                 # Query facts stay local to this decision, never in long-lived State or JSONL.
                 continue
 
@@ -684,6 +698,9 @@ async def making_next_plan_loop(
                     supervisor, response.get("message"), call, tool_result
                 )
             )
+            boundary("decision_tool_summary", "supervisor", tool_name=call.name, arguments=call.arguments,
+                     response_message=response.get("message"), tool_result_seq=(
+                         supervisor_state.last_tool_result_ref.tool_result_seq if supervisor_state.last_tool_result_ref else None))
 
             summary, parsed_result = await _validated_tool_summary(
                 now_state, chat_function, supervisor_client, supervisor, messages,
@@ -713,7 +730,6 @@ async def making_next_plan_loop(
                 "下一次必须返回完整 JSON，尤其必须包含 is_next_target。"
             )
             supervisor_state.memory_window.append(feedback)
-            del supervisor_state.memory_window[:-10]
             _save_supervisor_turn(
                 now_state,
                 supervisor_state,
@@ -775,6 +791,42 @@ async def making_next_plan_loop(
     return blocked
 
 
+async def resume_supervisor_tool_summary(now_state, supervisor_state, evaluation_state, executor_state,
+                                         provider, client, chat_function):
+    """Rebuild a pending observation from its locator, never call the original tool."""
+    from State.session_checkpoint import active_run
+    from State.save_tool_result import read_tool_result_record
+    from MCP_functions.tool_registry import ToolExecutionResult
+    from AgentLoop.loop_utils import NormalizedToolCall
+    run = active_run()
+    payload = dict(run.payload)
+    phase = run.phase
+    tool_result = await _restore_query_result(now_state, payload)
+    call = NormalizedToolCall("restored_supervisor_observation", payload["tool_name"], payload["arguments"], {
+        "id": "restored_supervisor_observation", "type": "function", "function": {
+            "name": payload["tool_name"], "arguments": json.dumps(payload["arguments"], ensure_ascii=False)}})
+    model_type = PlanningResult if phase == "planning_tool_summary" else SupervisorDecisionResult
+    messages = (build_model_messages(provider, _load_planning_skill(), {
+        "user_query": now_state.user_query, "conversation_context": now_state.conversation_context})
+        if model_type is PlanningResult else _build_decision_message(now_state, supervisor_state, evaluation_state, executor_state, provider))
+    messages.extend(build_tool_observation_messages(provider, payload.get("response_message"), call, tool_result))
+    run.resume = False
+    _, result = await _validated_tool_summary(now_state, chat_function, client, provider, messages,
+        model_type, supervisor_state, phase, evaluation_state=evaluation_state)
+    if result is None:
+        raise RuntimeError("pending Supervisor observation summary failed; original tool remains executed")
+    if model_type is PlanningResult:
+        _apply_plan(now_state, supervisor_state, result)
+        _save_supervisor_turn(now_state, supervisor_state, "planning", result.description)
+        await _prepare_initial_guidance(now_state, supervisor_state, chat_function, client, provider)
+    else:
+        _apply_decision(now_state, supervisor_state, evaluation_state, executor_state, result)
+        seq = _save_supervisor_turn(now_state, supervisor_state, "decision", result.description)
+        if result.is_finished:
+            _persist_task_summary(now_state, supervisor_state, evaluation_state, executor_state, result, seq)
+    return result
+
+
 async def summarize_supervisor_descriptions(
     now_state: AgentState,
     supervisor_state: SupervisorState,
@@ -800,14 +852,12 @@ async def summarize_supervisor_descriptions(
         supervisor,
         prompt,
         {
-            "user_query": bounded_text(
-                now_state.user_query, USER_QUERY_MAX_CHARS
-            ),
+            "user_query": now_state.user_query,
             "status": status,
-            "answer": bounded_text(answer, DESCRIPTION_MAX_CHARS),
+            "answer": answer,
             "block_reason": block_reason,
             "supervisor_descriptions": (
-                now_state.supervisor_descriptions.model_context()
+                {"entries": now_state.supervisor_descriptions.to_dicts(), "omitted_earlier_entries": 0}
             ),
             "task_outcomes": [
                 outcome.to_dict()
@@ -894,7 +944,7 @@ def _build_supervisor_evaluation_message(
         "executor_is_error": executor_state.is_error,
         "executor_error_message": executor_state.error_message,
         "skills": _skill_catalog(skill_list),
-        "supervisor_history": list(supervisor_evaluation_state.memory_window)[-10:],
+        "supervisor_history": list(supervisor_evaluation_state.memory_window),
     }
     if selected_skill is not None:
         information["selected_skill"] = {
@@ -984,7 +1034,7 @@ def _build_decision_message(
             for task_id, outcome in sorted(now_state.task_outcomes.items())
             if task_id <= now_state.now_task_id
         ],
-        "memory_window": list(supervisor_state.memory_window)[-10:],
+        "memory_window": list(supervisor_state.memory_window),
     }
     return build_model_messages(supervisor, _load_decision_prompt(), information)
 
@@ -992,9 +1042,28 @@ def _build_decision_message(
 async def _call_supervisor_model(
     now_state, chat_function, client, provider, messages, tools
 ):
+    from AgentLoop.context_compression import prepare_request, ContextBudgetError
+    async def compression_call(compression_messages, compression_tools):
+        return await _counted_supervisor_call(now_state, chat_function, client, provider,
+                                              compression_messages, compression_tools)
+    try:
+        messages = await prepare_request(now_state, messages, tools, compression_call)
+    except ContextBudgetError as exc:
+        return {"status": "error", "message": str(exc), "tool": []}
+    return await _counted_supervisor_call(now_state, chat_function, client, provider, messages, tools)
+
+
+async def _counted_supervisor_call(now_state, chat_function, client, provider, messages, tools):
+    if len(json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False)) > now_state.context_max_chars:
+        return {"status": "error", "message": "context_budget_blocked: model/compression request exceeds hard character budget", "tool": []}
     if now_state.model_request_count >= now_state.max_model_requests:
         return {"status": "error", "message": "model request budget exhausted", "tool": []}
     now_state.model_request_count += 1
+    from State.session_checkpoint import active_run
+    run = active_run()
+    if run:
+        run.emit("model_request", "supervisor", model_request_count=now_state.model_request_count)
+        run.checkpoint()
     response = await call_chat_function(
         chat_function,
         provider,
@@ -1005,6 +1074,8 @@ async def _call_supervisor_model(
         now_state.temperature,
     )
     now_state.total_token += response.get("total_tokens", 0)
+    if run:
+        run.checkpoint()
     return response
 
 
@@ -1015,6 +1086,8 @@ async def _prepare_initial_guidance(
     client,
     supervisor,
 ):
+    from State.session_checkpoint import boundary
+    boundary("initial_guidance", "supervisor")
     prompt = """
 规划已经完成，当前没有 Executor 输出。这里只为 task_list[0] 建立第一次 handoff，不进行验收。
 executor_guidance 应说明当前 task 的最小执行范围、优先工具/路径、停止条件和必要异常处理；
@@ -1031,9 +1104,9 @@ executor_guidance 应说明当前 task 的最小执行范围、优先工具/路�
         supervisor,
         prompt,
         {
-            "user_query": bounded_text(now_state.user_query, USER_QUERY_MAX_CHARS),
+            "user_query": now_state.user_query,
             "task_list": now_state.task_list,
-            "now_task_id": 0,
+            "now_task_id": now_state.now_task_id,
             "now_target": now_state.now_target,
         },
     )
@@ -1069,17 +1142,18 @@ executor_guidance 应说明当前 task 的最小执行范围、优先工具/路�
         + guidance.completion_criteria
     )
     supervisor_state.verification_requirement = guidance.completion_criteria
-    now_state.task_completion_criteria[0] = guidance.completion_criteria
+    now_state.task_completion_criteria[now_state.now_task_id] = guidance.completion_criteria
     supervisor_state.original_completion_criteria = guidance.completion_criteria
     from AgentLoop.agent import SupervisorHandoff
     handoff = SupervisorHandoff(
         supervisor_seq=now_state.supervisor_seq,
-        task_id=0,
+        task_id=now_state.now_task_id,
         target=now_state.now_target,
         instruction=guidance.executor_guidance,
         completion_criteria=guidance.completion_criteria,
+        dependency_context=[value for key, value in sorted(now_state.task_outcomes.items()) if key < now_state.now_task_id],
     )
-    now_state.task_handoffs[0] = handoff
+    now_state.task_handoffs[now_state.now_task_id] = handoff
     supervisor_state.handoff = handoff
     supervisor_state.description = guidance.description
     supervisor_state.output_content = guidance.description
@@ -1089,10 +1163,11 @@ executor_guidance 应说明当前 task 的最小执行范围、优先工具/路�
 
 
 def _apply_plan(now_state, supervisor_state, result):
-    now_state.task_list = list(result.task_list)
-    now_state.now_task_id = 0
-    now_state.now_target = now_state.task_list[0]
-    supervisor_state.task_id = 0
+    start = getattr(now_state, "request_start_task_id", 0)
+    now_state.task_list = list(now_state.task_list[:start]) + list(result.task_list)
+    now_state.now_task_id = start
+    now_state.now_target = now_state.task_list[start]
+    supervisor_state.task_id = start
     supervisor_state.target = now_state.now_target
     supervisor_state.description = result.description
     supervisor_state.output_content = result.description
@@ -1383,6 +1458,14 @@ def _save_supervisor_tool_event(
     supervisor_state.input_content = arguments
     supervisor_state.output_content = supervisor_state.description
     save_supervisor_state_history(supervisor_state, record_type=f"{phase}_tool_event")
+    from State.session_checkpoint import active_run
+    run = active_run()
+    if run and run.current_operation:
+        run.emit("tool_completed", "supervisor", operation_id=run.current_operation,
+                 tool_name=tool_name, tool_result_seq=(supervisor_state.last_tool_result_ref.tool_result_seq
+                    if supervisor_state.last_tool_result_ref else None), ok=tool_result.ok,
+                 status="success" if tool_result.ok else tool_result.error_type)
+        run.current_operation = None
     supervisor_state.tool_event_seq = supervisor_state.supervisor_seq
     return supervisor_state.supervisor_seq
 
@@ -1490,7 +1573,6 @@ async def _validated_tool_summary(
             _evaluation_memory(memory_state, feedback)
         else:
             supervisor_state.memory_window.append(feedback)
-            del supervisor_state.memory_window[:-10]
         retry_messages = [
             *retry_messages, {"role": "user", "content": feedback}
         ]
@@ -1502,10 +1584,7 @@ async def _validated_tool_summary(
 
 def _evaluation_memory(state, description):
     if description:
-        state.memory_window.append(
-            bounded_text(description, DESCRIPTION_MAX_CHARS, keep_tail=True)
-        )
-        del state.memory_window[:-10]
+        state.memory_window.append(description)
 
 
 def _validate_decision_plan(now_state, result):
@@ -1572,6 +1651,53 @@ def _find_supervisor_skill(skills, skill_name):
     return selected
 
 
+def _query_descriptors(observations):
+    """Checkpoint locators/query actions, never the already-saved return bodies."""
+    result = []
+    for item in observations:
+        ref = item.get("tool_result_ref")
+        result.append({"tool_name": item["tool_name"], "arguments": dict(item["arguments"]),
+                       "tool_result_seq": ref.tool_result_seq if ref else None})
+    return result
+
+
+async def _restore_query_result(now_state, descriptor):
+    from State.save_tool_result import read_tool_result_record
+    from MCP_functions.tool_registry import ToolExecutionResult
+    if descriptor.get("tool_result_seq") is not None:
+        record = read_tool_result_record(now_state.session_address, now_state.chat_id, descriptor["tool_result_seq"])
+        if record["status"] != "success":
+            raise RuntimeError("pending Supervisor result unavailable; original tool will not be replayed")
+        return ToolExecutionResult(**record["record"]["content"])
+    name = descriptor["tool_name"]
+    if name not in SUPERVISOR_ONLY_TOOLS:
+        raise RuntimeError("ordinary tool lacks persisted locator; automatic replay refused")
+    from Context import mcp_resources, mcp_supervisor_tools
+    arguments = {key: value for key, value in descriptor["arguments"].items()
+                 if key not in {"session_address", "chat_id", "branch_id"}}
+    arguments.update(session_address=now_state.session_address, chat_id=now_state.chat_id)
+    function = getattr(mcp_resources, name, None) or getattr(mcp_supervisor_tools, name)
+    # Historical reads are safe views, not new side effects or new raw facts.
+    return ToolExecutionResult(name, "host_history", True, None, "", await function(**arguments))
+
+
+async def _restore_stage_queries(now_state, phase):
+    from State.session_checkpoint import active_run
+    from State.save_tool_result import ToolResultLocator
+    run = active_run()
+    descriptors = run.payload.get("queries", []) if run and run.phase == phase else []
+    observations, fingerprints = [], set()
+    for descriptor in descriptors:
+        tool_result = await _restore_query_result(now_state, descriptor)
+        seq = descriptor.get("tool_result_seq")
+        locator = ToolResultLocator(now_state.session_address, now_state.chat_id, seq) if seq is not None else None
+        observations.append(_memory_query_observation(descriptor["tool_name"], descriptor["arguments"], tool_result, locator))
+        arguments = {key: value for key, value in descriptor["arguments"].items()
+                     if phase == "evaluation" or key not in {"session_address", "chat_id"}}
+        fingerprints.add(_memory_query_fingerprint(descriptor["tool_name"], arguments))
+    return observations, fingerprints, (run.payload.get("rounds", 0) if run and run.phase == phase else 0)
+
+
 def _memory_query_fingerprint(tool_name, arguments):
     return json.dumps(
         {"tool_name": tool_name, "arguments": arguments},
@@ -1586,11 +1712,7 @@ def _memory_query_observation(tool_name, arguments, tool_result, locator=None):
         "tool_name": tool_name,
         "arguments": arguments,
         "ok": tool_result.ok,
-        "result": bounded_text(
-            tool_result.to_model_content(),
-            TOOL_RESULT_CONTEXT_MAX_CHARS,
-            keep_tail=True,
-        ),
+        "result": tool_result.to_model_content(),
     }
     if locator is not None:
         observation["tool_result_ref"] = locator
@@ -1646,11 +1768,7 @@ def _load_supervisor_skill(skills, selection):
 
 def _read_skill(skill):
     try:
-        return bounded_text(
-            Path(skill.address).read_text(encoding="utf-8"),
-            DESCRIPTION_MAX_CHARS,
-            keep_tail=True,
-        )
+        return Path(skill.address).read_text(encoding="utf-8")
     except OSError:
         return ""
 

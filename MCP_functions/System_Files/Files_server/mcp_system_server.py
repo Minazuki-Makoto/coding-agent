@@ -155,7 +155,7 @@ can download dependencies, change build output, and overwrite a destination JAR.
     """
 )
 async def package_spring_boot_with_confirmation_tool(project_path:str, temp_path:str):
-    return package_spring_boot_with_confirmation(project_path=project_path, temp_path=temp_path, interactive=True)
+    return package_spring_boot_with_confirmation(project_path=project_path, temp_path=temp_path, interactive=False)
 
 
 @mcp.tool(
@@ -246,7 +246,7 @@ a model-generated argument.
     """
 )
 async def download_package_with_confirmation_tool(editor_address:str, package_name:str):
-    return download_package_with_confirmation(editor_address=editor_address, package_name=package_name, interactive=True)
+    return download_package_with_confirmation(editor_address=editor_address, package_name=package_name, interactive=False)
 
 
 def get_system_stdio_parameters() -> dict[str,StdioServerParameters]:

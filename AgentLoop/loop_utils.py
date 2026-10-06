@@ -85,9 +85,8 @@ def build_tool_observation_messages(
     tool_result: ToolExecutionResult,
 ) -> list[dict]:
     """Build one provider-valid assistant tool call and tool observation pair."""
-    content = bounded_text(
-        tool_result.to_model_content(), TOOL_RESULT_CONTEXT_MAX_CHARS, keep_tail=True
-    )
+    # Complete observation enters explicit async context preparation at the call site.
+    content = tool_result.to_model_content()
     if provider == "claude":
         assistant_content: list[dict[str, Any]] = []
         if response_message:

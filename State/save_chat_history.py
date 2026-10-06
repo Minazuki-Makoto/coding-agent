@@ -21,7 +21,7 @@ def save_chat_history(
     with open(session_address / "chat_history.jsonl",'a',encoding='utf-8') as f:
         f.write(
             json.dumps(
-                {
+                _annotate({
                     "chat_id":chat_id,
                     "task_number":task_number,
                     "seq_number":seq_number,
@@ -34,6 +34,11 @@ def save_chat_history(
                     "elapsed_time_seconds":elapsed_time_seconds,
                     "started_at":started_at,
                     "finished_at":finished_at,
-                },ensure_ascii=False,
+                }),ensure_ascii=False,
             )+'\n'
         )
+
+
+def _annotate(record):
+    from State.session_checkpoint import annotate_record
+    return annotate_record(record, "chat_history.jsonl")

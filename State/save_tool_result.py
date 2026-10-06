@@ -141,13 +141,19 @@ def save_tool_result(
         content=tool_result.to_dict(),
         created_at=datetime.now().isoformat(timespec="milliseconds"),
     )
+    from State.session_checkpoint import annotate_record
+    serialized_record = annotate_record(to_jsonable(asdict(record)), "tool_results.jsonl")
+    from State.session_checkpoint import active_run
+    run = active_run()
+    if run and run.current_operation:
+        serialized_record["operation_id"] = run.current_operation
     with _path_lock(path):
         with _cross_process_lock(path):
             if tool_result_seq <= load_last_tool_result_seq(session_address, str(chat_id)):
                 raise ValueError("tool_result_seq conflicts with an existing record")
             with path.open("a", encoding="utf-8") as history_file:
                 history_file.write(
-                    json.dumps(to_jsonable(asdict(record)), ensure_ascii=False) + "\n"
+                    json.dumps(serialized_record, ensure_ascii=False) + "\n"
                 )
                 history_file.flush()
     return ToolResultLocator(
@@ -166,6 +172,9 @@ def read_tool_result_record(session_address: str, chat_id: str, tool_result_seq:
             if not line.strip():
                 continue
             record = json.loads(line)
+            from State.session_checkpoint import record_visible
+            if not record_visible(record):
+                continue
             if (
                 record.get("chat_id") == chat_id
                 and record.get("tool_result_seq") == tool_result_seq
