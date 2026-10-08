@@ -75,7 +75,7 @@ async def read_history_chat(
     records = _read_history_chat(session_address)
     if chat_id is None or not isinstance(records,list):
         return records
-    return [record for record in records if record.get("chat_id") == chat_id]
+    return [record for record in records if str(record.get("chat_id", "main")) == chat_id]
 
 @mcp_server.tool(
     name = "read_task_history_error",

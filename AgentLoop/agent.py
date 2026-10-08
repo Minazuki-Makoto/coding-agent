@@ -1,4 +1,5 @@
 from __future__ import annotations
+from terminal_render import process
 
 import inspect
 import asyncio
@@ -342,6 +343,10 @@ class AgentState:
     supervisor_model: str = ""
     temperature: float = 0.3
     max_executor_steps: int = 10
+    project_root: str | None = None
+    staging_root: str | None = None
+    workspace_revision: int = 0
+    workspace_hash: str | None = None
     max_supervision_times: int = 10
     max_task_attempts: int = 3
     max_model_requests: int = 80
@@ -458,7 +463,7 @@ async def _run_main(
     session_address: str,
     chat_id: str,
     started_at: datetime,
-    *, session_run=None, runtime_config=None, sandbox_policy=None, approval=None,
+    *, session_run=None, runtime_config=None, sandbox_policy=None, approval=None, project_workflow=None,
 ):
     config = runtime_config or load_runtime_config()
     now_state = state_init(session_address, chat_id, query, config)
@@ -488,9 +493,10 @@ async def _run_main(
         load_last_tool_result_seq(now_state.session_address, now_state.chat_id))
     from MCP_functions.sandbox import SandboxPolicy
     from MCP_functions.execution_gateway import ExecutionGateway
-    sandbox_policy = sandbox_policy or SandboxPolicy(str(Path.cwd()), str(Path(session_address).resolve()),
-        mode="read-only", protected_paths=(str(INFORMATION_PATH),))
-    gateway = ExecutionGateway(sandbox_policy, approve=approval, capabilities=config.tool_capabilities)
+    # No implicit cwd/project grant. Legacy callers can supply a trusted policy;
+    # the terminal always supplies the runtime-authorization workflow.
+    gateway = ExecutionGateway(sandbox_policy, approve=approval, capabilities=config.tool_capabilities,
+                               project_workflow=project_workflow)
     supervisor_client = None
     executor_client = None
     status = "blocked"
@@ -500,8 +506,8 @@ async def _run_main(
 
     async with AsyncExitStack() as stack:
         host = mcp_host(stack)
-        await _register_mcp_clients(host, config.writable_roots, sandbox_policy=sandbox_policy,
-                                    allow_external=bool(config.tool_capabilities))
+        await _register_mcp_clients(host, () if project_workflow else config.writable_roots, sandbox_policy=sandbox_policy,
+                                    allow_external=bool(config.tool_capabilities) and not project_workflow)
         registry = ToolRegistry(
             host,
             execution_gateway=gateway,
@@ -544,7 +550,7 @@ async def _run_main(
                 skill_lists=supervisor_skills,
             )
 
-            print(f"""
+            process(f"""
             \n任务列表清单：{now_state.task_list}
             """)
 
@@ -571,6 +577,9 @@ async def _run_main(
                     supervisor_state,
                     executor_state,
                 )
+                    if project_workflow and project_workflow.denied:
+                        block_reason = "authorization_denied: 用户拒绝授权，当前请求已停止，请重新说明需求"
+                        break
                     boundary("evaluation", "supervisor")
                     if executor_state.exit_reason == "executor_operation_unknown":
                         block_reason = "unknown operation: inspect real effects before selecting a new boundary"
@@ -591,6 +600,10 @@ async def _run_main(
                     evaluation_state,
                     executor_state,
                 )
+                if session_run:
+                    # A restored decision that rejects must return to Executor,
+                    # not keep re-entering the restored decision phase forever.
+                    session_run.resume = False
                 if supervisor_state.proposed_task_list is not None:
                     now_state.task_list = list(supervisor_state.proposed_task_list)
                 if decision.is_next_target:
@@ -649,7 +662,8 @@ async def _run_main(
         except Exception as exc:
             block_reason = str(exc)
         finally:
-            if now_state.supervisor_descriptions.entries and not asyncio.current_task().cancelling():
+            if (now_state.supervisor_descriptions.entries and not asyncio.current_task().cancelling()
+                    and not (project_workflow and project_workflow.denied)):
                 try:
                     chat_description = await summarize_supervisor_descriptions(
                         now_state=now_state,
@@ -680,6 +694,9 @@ async def _run_main(
             )
         )
 
+    if project_workflow and project_workflow.staging_root:
+        answer += "\n\nHost 提示：以上文件修改、构建或检查发生在隔离副本；是否写回真实项目，以随后终端的固定变更包批准和应用结果为准。"
+
     if session_run:
         session_run.phase = "completed" if status == "completed" else session_run.phase
         session_run.emit("answer", "host", status=status, answer=answer,
@@ -708,7 +725,7 @@ async def _run_main(
         finished_at=finished_at.isoformat(timespec="seconds"),
     )
 
-    print(f"""
+    process(f"""
     executor任务执行总轮次:{now_state.executor_seq},
     \nsupervisor任务执行总轮次:{now_state.supervisor_seq},
     \n任务列表清单：{now_state.task_list}
@@ -728,16 +745,18 @@ async def _run_main(
 
 
 async def main(query: str, session_address: str, chat_id: str, *, session_run=None,
-               runtime_config=None, sandbox_policy=None, approval=None):
+               runtime_config=None, sandbox_policy=None, approval=None, project_workflow=None):
     """Convert startup failures into a saved blocked result."""
     started_at = datetime.now()
     from State.session_checkpoint import ACTIVE_RUN
     token = ACTIVE_RUN.set(session_run)
+    from State.project_workspace import WORKSPACE
+    workspace_token = WORKSPACE.set(project_workflow)
     try:
-        if session_run or runtime_config or sandbox_policy:
+        if session_run or runtime_config or sandbox_policy or project_workflow:
             result = await _run_main(query, session_address, chat_id, started_at,
                 session_run=session_run, runtime_config=runtime_config,
-                sandbox_policy=sandbox_policy, approval=approval)
+                sandbox_policy=sandbox_policy, approval=approval, project_workflow=project_workflow)
         else:
             result = await _run_main(query, session_address, chat_id, started_at)
 
@@ -776,8 +795,9 @@ async def main(query: str, session_address: str, chat_id: str, *, session_run=No
                              total_tokens=preserved_tokens, block_reason=str(exc))
             session_run.checkpoint("blocked")
     finally:
+        WORKSPACE.reset(workspace_token)
         ACTIVE_RUN.reset(token)
-    print(
+    process(
         f"Total tokens: {result['total_tokens']}, "
         f"elapsed time: {result['elapsed_time_seconds']} seconds"
     )

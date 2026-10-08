@@ -35,7 +35,7 @@ class SandboxPolicy:
     output_max_chars: int = 20000
     toolchains: dict = field(default_factory=lambda: {"python": "/usr/local/bin/python",
         "java": "/usr/lib/jvm/java-17-openjdk-amd64/bin/java", "javac": "/usr/lib/jvm/java-17-openjdk-amd64/bin/javac",
-        "mvn": "/usr/bin/mvn", "gradle": "/usr/bin/gradle"})
+        "mvn": "/usr/bin/mvn", "gradle": "/usr/bin/gradle", "sh": "/bin/sh"})
     version: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def __post_init__(self):
@@ -59,6 +59,11 @@ class SandboxPolicy:
             candidate = Path(self.workspace) / candidate
         if ".." in candidate.parts:
             raise PermissionDenied("parent traversal is not allowed")
+        for item in (*candidate.parents, candidate):
+            if item.exists() or item.is_symlink():
+                info = item.lstat()
+                if item.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+                    raise PermissionDenied("symlink/junction/reparse paths are not allowed")
         candidate = candidate.resolve(strict=False)
         protected = (self.state_dir, *self.protected_paths)
         if any(_within(candidate, Path(item).resolve()) for item in protected):

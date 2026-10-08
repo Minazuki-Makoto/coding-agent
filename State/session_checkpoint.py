@@ -150,15 +150,42 @@ class SessionStore:
         if owner not in limits:
             return False
         cutoff = limits[owner]
-        seq = record.get("event_seq")
-        # Legacy records cannot prove a rewind boundary. Main may display them.
+        from State.history_recovery import indexed_identity
+        identity = indexed_identity(self, record)
+        seq = identity.get("event_seq")
         return cutoff is None or (type(seq) is int and seq <= cutoff)
 
     def history(self, filename, branch="main", all_branches=False):
         self.validate_branch(branch)
-        return [row for row in rows(self.path / filename)
+        from State.history_recovery import indexed_rows, legacy_events
+        records = indexed_rows(self, filename)
+        if filename == "timeline.jsonl":
+            records.extend(legacy_events(self))
+            records.sort(key=lambda row: row.get("event_seq", 0))
+        return [row for row in records
                 if row.get("chat_id", self.chat_id) == self.chat_id
                 and (all_branches or self.visible(row, branch))]
+
+    def latest_event_seq(self):
+        from State.history_recovery import high_water
+        return high_water(self)
+
+    def open_history(self, branch="main"):
+        """Create a fresh chat checkpoint from recorded context, never replay tools."""
+        from State.history_recovery import ensure_index, rebuild_bundle
+        with single_writer(self.path):
+            if not self.directory.resolve().is_relative_to(self.path):
+                raise ValueError("chat directory escapes session")
+            self.initialize()
+            self.validate_branch(branch)
+            checkpoint = self.directory / "checkpoints" / f"{branch}.json"
+            if checkpoint.is_file():
+                return
+            ensure_index(self)
+            run = ActiveRun(self, branch)
+            run.bundle = rebuild_bundle(self, branch)
+            run.payload = {"recovery_mode": "history", "requires_new_request": True}
+            run.checkpoint("ready")
 
     def load(self, branch="main"):
         self.validate_branch(branch)
@@ -243,19 +270,34 @@ class SessionStore:
         document["bundle"] = bundle
         return document
 
-    def fork(self, event_seq, branch="main"):
+    def fork(self, event_seq, branch="main", allow_history=False):
         with single_writer(self.path):
             matches = [row for row in self.history("timeline.jsonl", branch)
                        if row.get("event_seq") == event_seq]
-            if len(matches) != 1 or not matches[0].get("before_snapshot"):
+            if len(matches) != 1:
+                raise ValueError("event not found in the current branch")
+            if not matches[0].get("before_snapshot") and not allow_history:
                 raise ValueError("event has no verified pre-state; cannot precisely rewind")
             event = matches[0]
-            snapshot = self.directory / event["before_snapshot"]
-            document = json.loads(snapshot.read_text(encoding="utf-8"))
+            snapshot = self.directory / event["before_snapshot"] if event.get("before_snapshot") else None
+            if snapshot and snapshot.is_file():
+                document = json.loads(snapshot.read_text(encoding="utf-8"))
+            elif not allow_history:
+                raise ValueError("event snapshot is unavailable")
+            else:
+                document = None
             new_branch = "b_" + uuid.uuid4().hex[:12]
             branches = self.branches()
             branches[new_branch] = {"parent": branch, "cutoff": event_seq - 1}
             self._write("branches.json", branches)
+            if document is None:
+                from State.history_recovery import rebuild_bundle
+                run = ActiveRun(self, new_branch)
+                run.bundle = rebuild_bundle(self, new_branch, replay=event)
+                run.payload = {"recovery_mode": "history", "rewind_event_seq": event_seq,
+                               "inferred_order": event.get("inferred_order", False)}
+                run.checkpoint("rewound" if run.bundle["agent"].user_query else "ready")
+                return new_branch
             document["branch_id"] = new_branch
             bundle = decode(document["bundle"])
             bundle["agent"].branch_id = new_branch
@@ -275,7 +317,7 @@ class ActiveRun:
         self.resume = False
         self.current_snapshot = None
         self.current_operation = None
-        self.event_seq = max((row.get("event_seq", 0) for row in rows(store.path / "timeline.jsonl")), default=0)
+        self.event_seq = store.latest_event_seq()
 
     def checkpoint(self, status="running"):
         if self.bundle is None:

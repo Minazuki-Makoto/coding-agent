@@ -56,7 +56,8 @@ def read_task_summary_context(
         body = content[start:end].strip()
         branch_marker = re.search(r"<!-- branch_id=(\S+) event_seq=(\d+) -->", body)
         identity = ({"branch_id": branch_marker.group(1), "event_seq": int(branch_marker.group(2)),
-                     "chat_id": str(chat_id)} if branch_marker else {"chat_id": str(chat_id)})
+                     "chat_id": str(chat_id)} if branch_marker else {"chat_id": str(chat_id),
+                     "task_id": task_id, "_legacy_supervisor_seq": supervisor_seq})
         if not record_visible(identity):
             continue
         latest_by_task[task_id] = {

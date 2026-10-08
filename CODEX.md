@@ -1,6 +1,6 @@
 # Coding Agent 当前项目说明
 
-更新时间：2026-10-05
+更新时间：2026-10-08
 
 本文记录当前源码的整体架构、运行顺序、状态和持久化边界，不把历史建议当作已实现功能。用户当前指令优先；本文与代码不一致时，重新核实源码。本文不是自动启动或修改项目的指令。
 
@@ -33,6 +33,8 @@ coding_agent/
 ├── CODEX.md / PROBLEM.md / README.md
 ├── INFORMATION.json                     # 运行配置；不得输出凭据
 ├── backend.py / terminal_cli.py         # 交互终端入口，不是 HTTP 服务
+├── terminal_render.py                  # 可信清洗、淡色过程显示、NO_COLOR
+├── terminal_select.py                  # Windows 方向键/Tab 选择 yes/no，Enter 确认
 ├── AgentChat/
 │   ├── Chatgpt_chat.py / GLM_chat.py / Claude_chat.py
 │   └── DeepSeek_chat.py / Qwen_chat.py
@@ -69,6 +71,8 @@ coding_agent/
 │   ├── save_tool_result.py               # 原始结果、locator、summary、追加锁
 │   ├── task_summary.py                   # chat 隔离、Markdown 记录与摘要读取
 │   └── session_checkpoint.py            # 类型化恢复、timeline、前置状态、分支
+│   # permissions.py：Host 不可变授权；terminal_settings.py：稳定用户级设置
+│   # project_workspace.py：隔离副本、基线、固定变更包、受控应用事务
 ├── sandbox/Dockerfile                   # 可信 Python/JDK 工具链镜像构建说明
 ├── ExecutorBooks/Executor_textbook.md / Executor_mistake_book.md
 └── tests/
@@ -81,6 +85,38 @@ coding_agent/
 ## 4. 主运行流程
 
 入口保留异步 AgentLoop.agent.main(query, session_address, chat_id)，backend.py 改为 terminal_cli.py 的终端启动入口。CLI 负责新建/精确恢复/连续问答、权限和授权；恢复或回退本身不运行模型、工具，/continue 才继续当前阶段。查看 README.md 的实际命令。
+
+日常在仓库根目录启动：`& "D:\anacode\python.exe" -m backend`，无需 workspace/state-dir/sandbox 参数。
+不会把 cwd/Agent 仓库自动绑定为目标项目；普通问答、设置、历史不依赖 Docker。
+Windows 状态默认 D:\coding-agent-state；稳定用户设置在 %LOCALAPPDATA%\coding-agent\settings.json，
+非 Windows 使用 ~/.local/share/coding-agent/state 和 ~/.config/coding-agent/settings.json。
+`/settings state-dir` 验证后原子保存，对后续新会话/重启生效，不迁移活动会话。
+`/project` 只选择候选；也可从工具明确绝对路径推导候选，不再要求用户在工具调用中输入目录。
+路径缺失或无效反馈模型重新选择参数，不隐式使用 cwd。
+
+每次普通工具调用、复制/检查副本、应用固定变更包是独立批准范围。
+Executor 和 Supervisor 的普通文件/执行/信息工具每次都显示 yes/no 与实际参数；一次批准不授予下一次调用。
+Supervisor 的九个历史查询工具不弹确认，仍检查角色权限、Host session/chat 绑定及分支范围。
+ToolPermission 是 Host 生成的 frozen dataclass，初始 is_permitted=false，用户 yes 后由 Host 更新为 true；
+绑定工具、角色、实际参数及执行环境摘要、根目录、session/chat/branch/request 和策略版本，执行前校验并消费。
+模型不能修改 is_permitted 或在参数中提供批准。按当前用户 UI 约定，选项默认 yes，但必须 Enter 明确确认才批准；切到 no、EOF/取消/非交互拒绝停止当前请求，回到输入界面。
+Windows 真实终端使用标准库 msvcrt 键盘菜单：方向键/Tab 切换，Enter 确认，Esc/Ctrl+C 取消。不支持键盘菜单时使用 1=yes/2=no 行输入兼容模式，Enter 确认默认 yes；非交互仍拒绝。Executor 普通过程为淡白、Supervisor 为淡绿，Host 灰色；授权黄色、错误红色优先，NO_COLOR/--color never/输出重定向保持纯文本。角色由可信调用点/actor 字段指定，不从模型正文推测，不把 ANSI 写入历史。
+原有 Permission 继续用于复制、网络和固定包批准；终端启用逐次模式，旧显式可信 API 保持兼容。
+真实项目仍只读，进程/编辑前先确认副本，之后再批准具体工具；副本位于 state_dir 同级的专用 staging 子目录，
+复制当前磁盘（包含未提交修改），保留基线文件哈希/类型/模式/编码与原始字节、目录和排除清单。
+源码写入在副本容器里，进程仅挂副本，状态、基线、变更包和凭据保持在容器外；网络单独确认。
+Docker 缺失不阻止普通问答/只读分析，但阻止副本执行，不降级 Host。
+默认排除依赖/构建产物/凭据，保留 .env.example/.gitignore/必要 wrapper；额外排除可通过设置添加。
+
+`/diff` 创建不可变 cs_<SHA256> 包并展示差异和实际测试证据；`/apply ID` 重新展示和批准固定版本，
+模型完成且有可应用改动时自动展示该包并单独询问 yes/no；应用/拒绝另存 Host 事实事件并供后续上下文使用。
+模型最终答案明确标注副本执行范围，不把副本完成当成真实项目已应用。
+先检查原文件基线、新增目标、路径/链接/大小写与保护范围，再用包内固定字节应用，不能读另一版本副本。
+单文件原子替换、备份和逐文件事务日志不等于整批事务；失败尝试恢复，不覆盖外部并发的新修改。
+`/apply-status` 检查 applying/unknown/已应用日志与当前哈希，不自动重放；`/export ID` 导出 patch 到包目录。
+二进制/超大文本/特殊文件变化不自动应用；纯权限和空目录变化不写回。
+新分支没有对应副本文件快照时明确阻塞重新生成，不能共享可写副本或把逻辑回退说成磁盘回滚。
+恢复只加载状态/项目候选，不继承批准；继续项目工具时重新授权并验证副本版本。
 
 ~~~text
 main：datetime.now() 记录开始时间
@@ -109,6 +145,9 @@ evaluation 判断本轮 Executor 子目标；decision 判断整个当前 task �
 ### 5.1 AgentState
 
 请求级共享状态：session/chat/query、任务列表与当前 task、三个独立 seq、模型配置、预算、token 累计、运行环境、Supervisor description 历史。
+
+project_root/staging_root/workspace_revision/workspace_hash 用于资源身份与恢复校验，不代表授权；
+实际 Permission 由当前 Host workflow 创建，不恢复旧 is_permitted。
 
 task 级映射保留原始完成条件、handoff、previous/accepted/remaining work、证据定位、已执行调用签名、可复用读取、正式 TaskOutcome、累计摘要及已保存摘要 seq。
 
@@ -168,6 +207,19 @@ planning 返回非空任务列表；initial_guidance 建立指导与完成条件
 
 decision 同时生成 TaskSummaryDraft，包含本轮结果、累计有效成果、当前验收、旧结论修正、剩余工作、下一步与正式成果摘要。继续或否决可写累计摘要，但不能新增已完成 TaskOutcome。
 
+decision 的 is_finished 仅表示本次控制决策形成；否决并明确要求 Executor 修改时也必须为 true。
+Host 对无工具、完整 task_summary 且有具体下一步（或推进决定）的回复，仅纠正被误写为 false
+的阶段完成标志，再执行原有计划、否决及 TaskOutcome 校验；不根据自然语言自动判定任务通过。
+原始模型标志保留在 raw_model_response_excerpt，实际应用状态保存 decision_finished。
+不完整/非法 decision 最多默认 3 次契约失败（CODING_AGENT_DECISION_CONTRACT_RETRIES 可配置），
+达到上限明确 decision_contract_exhausted；多工具协议错误独立最多连续 3 次，不占有效查询轮次。
+模型请求失败保留实际原因，不再统一覆盖成 decision_budget_exhausted。
+手动恢复并重新进入 decision 时清除上次退出原因，避免新决定成功后仍被旧 blocked 标志终止；
+不清除原始历史、不自动重置任务尝试或恢复权限。
+
+synthesize 模式的 Executor 若返回合法但未完成结果，立即交回 Supervisor 核查缺口，
+exit_reason=executor_synthesis_needs_review，不在没有工具的情况下重复等待；仍保留未完成判断。
+
 description 的现行用户约定：提示词要求少于 3000 字符，说明本轮动作、关键结果、验证和剩余问题；代码不因超过 3000 字符单独报错、重试或硬截断。非空、类型及其他结构化校验仍保留。
 
 TaskOutcome 字段有独立可配置长度校验：
@@ -193,6 +245,11 @@ TaskOutcome 字段有独立可配置长度校验：
 - 这是字符预算，不是模型 token 上下文窗口保证。大量不压缩的元数据、单独超大 query/规则仍可能 blocked。
 
 decision 继续区分本轮 Executor output/工具证据、本轮 Supervisor evaluation、历史辅助摘要可用性、TaskOutcome 和已查询 memory_query_results。task_summary.md 仍由模型按需查询，不自动灌入全部历史。本轮有效证据优先，Executor 自述不等于验收。
+
+跨 task 的摘要不是事实白名单。已有成功目录证据的 evidence_references.paths 能证明文件/包存在，
+不因 accepted_summary 省略而失效；不能据此认定源码职责、部署成功或实际调用链。
+evaluation/decision 消息显式提供 evidence_usage 说明证据层次、摘要省略、未通过 previous_work
+和原始验收条件的边界。Supervisor 有疑问时按 locator 查询旧事实，不要求 synthesize Executor 重读项目。
 
 ## 8. 历史保存格式
 
@@ -306,6 +363,14 @@ Java/Spring 检查与运行、文件写入/替换、Python 查找/运行/安装�
 
 工具角色权限仍为第一层；新增 ExecutionGateway/SandboxPolicy 检查文件、网络和副作用，SandboxRunner 通过真实 Docker 隔离用户进程。未知外部 MCP capability 默认拒绝。
 
+终端路径使用 project_workflow 动态建立策略，不启动/调用可绕过副本网关的外部 MCP。
+直接 main API 不再默认授予 cwd，只支持无项目问答或调用方显式传可信 policy/workflow。
+Supervisor-only 历史权限保持原样。副本读缓存绑定工作区/分支/request/版本；正文和目录有独立失效范围。
+逐次模式先取得 ToolPermission，再进行文件内容版本校验；缓存复用不重执行工具，成功后的总结重试不重复确认。
+逐次批准审计保存在 workspace 元数据 tool_permissions.json，checkpoint 不恢复批准。历史查询不走普通执行网关。
+成功工具先保存原始事实再总结；恢复/格式失败不会重做成功操作。恢复后的完整否决清除旧 resume 标志，
+下一次循环确实转回 Executor，不反复停在 decision。
+
 ## 11. 当前文件读取设计
 
 ### read_all_files_tool
@@ -344,6 +409,31 @@ INFORMATION.json 选择角色 provider、模型、温度、Java/Python 环境和
 
 ## 15. 已验证结果
 
+2026-10-08 续聊/主动回退：新增16项离线测试，完整回归207项：204通过、3项真实Docker测试跳过。覆盖无checkpoint旧chat直接续聊、两轮请求旧问答只继承一次、blocked/interrupted新问题不强制continue、任务前缀和正式成果不虚增、只含任务日志的chat发现、事件/task回退及重新规划确实调用模型、旧聊天/原始事实/Markdown的分支截止过滤、跨chat编号、原JSONL未改写、源变更拒绝和写入失败不切换。不调用真实模型、不修改真实session或业务项目；终端视觉和真实模型续聊质量未验收。
+
+2026-10-08 session 菜单与 description 显示：新增13项离线测试通过，完整回归191项：188通过、3项真实Docker测试跳过；AST检查通过。覆盖自动加载历史问答/任务、自动选最近chat（不提供chat菜单）、分支选择、取消不切换、无checkpoint仅查看、启动输入错误不崩溃、编号/模拟键盘菜单、角色description及最终答案样式不变、分支历史隔离。不调用真实模型、不修改业务项目；尚未人工Windows终端视觉验收。
+
+2026-10-07 历史浏览/旧 chat 打开：新增10项离线测试通过，完整回归178项：175通过、3项真实Docker测试跳过。覆盖非main chat重启后 /open 接着问答、Supervisor planning收到旧问答、task_id衔接、回退排除后续答案、未完成请求不能混入新问题、旧日志只读查看、chat隔离、分支前缀、分页和非法身份。未调用真实模型、未进行人工终端交互验收。
+
+2026-10-07 终端 UI：新增 14 项颜色/模拟按键测试，完整离线回归 168 项：165 通过、3 项真实 Docker opt-in 跳过；AST 检查通过。覆盖默认 yes 必须 Enter、切换 no、取消/EOF、Windows 扩展键解码及 TTY 路由、编号兼容、非交互拒绝、角色配色和 NO_COLOR。未进行人工 Windows 终端视觉体验或付费模型复跑；本次不改权限范围/任务逻辑，不启动 Docker。
+
+2026-10-07：逐次授权新增 test_per_tool_permissions.py，测试含 Supervisor 历史免确认及普通文件仍需确认、拒绝后不再调用模型、task_id/TaskOutcome 不推进、参数反馈、授权篡改/重用/写盘失败、总结重试和成功调用去重。
+真实 Docker 测试尝试受引擎管道 dockerDesktopLinuxEngine 不存在阻塞，不自动启动引擎、拉镜像；付费模型和专用 Python/JDK 工具链未验证。下面历史验收结果不代表本轮 Docker 已通过。
+最终离线完整回归 154 项：151 通过，3 项真实 Docker opt-in 跳过；新文件 25 项中 24 项离线通过，1 项真实 Docker 未完成。语法检查通过。
+
+2026-10-06 副本终端：最终完整回归 129 项全部通过（显式开启真实 Docker，无失败、无跳过），
+包含 Windows 临时 junction 排除、授权拒绝后立即停止、固定包/冲突/失败恢复、恢复否决转回 Executor，
+及 nginx:alpine 的真实副本隔离。默认 Python/JDK 镜像在本机不存在，因此该工具链与付费模型未验证。
+包括资源身份路径防逃逸、项目级应用锁、自动最终 yes/no、执行后元数据失败停止而不重执行。
+副本元数据只存验证事实/有界日志摘录；完整原始工具正文仍保存在 tool_results.jsonl，不复制到 workspace.json。
+
+2026-10-06 决策空转与跨 task 证据使用修复：独立源码副本完整离线回归 98 项，97 通过、
+1 项 opt-in 真实 Docker 集成跳过。新增 11 项回归覆盖完整否决的阶段结束纠正、否决不可绕过、
+正式成果不虚增、契约/协议有界重试、原始错误保留、写盘失败、证据上下文、综合结果交回监督，
+以及实际循环的两 task“否决→修改→通过→最终交付”。使用模拟模型，不代表真实模型一定通过。
+失败会话的 15 条原始 task 1 decision 回复逐条离线重放：均一次请求后返回明确否决，
+没有工具重执行或正式成果虚增；原会话日志未改写。
+
 最终原项目开启实际 Docker 后端后：87项全部通过，CLI --help 正常；下述默认跳过行为不影响单独实际验收结果。
 
 2026-10-05 使用 D:\anacode\python.exe，在临时工作区运行 unittest discover：87 项，86 通过，1 项实际 Docker 测试需 opt-in 默认跳过。原有67项回归仍通过；新增去重、完整压缩输入/计费预算、连续问答、checkpoint补偿、恢复与回退、分支读取、单写者、权限和授权检查。
@@ -356,13 +446,25 @@ INFORMATION.json 选择角色 provider、模型、温度、Java/Python 环境和
 
 ## 16. 当前优先级
 
+2026-10-08 终端易用性：/session 弹 session 选择菜单，不要求选 chat；自动选择最近更新且有检查点的 chat（同时间优先main），若该 chat 有多个分支再选择。复用 resume/open，自动显示对话最后一页、任务清单及角色历史 description 最后一页；不执行任务、不恢复旧批准。旧无检查点 session 也打开，在单写者锁内用 State/history_recovery.py 建立历史索引和 ready checkpoint；不改旧 JSONL、不复制工具正文，空目录没有可凭空回退的历史。启动 r 使用同一菜单，初始错误捕获后回到 agent>。
+
+terminal_select.choose_option 提供 Windows TTY 上下/Tab/Enter 选择和编号 fallback，空行/取消不切换。/sessions 保留列表，/open 保留显式 chat 入口。terminal_render.show_description 与普通过程同角色样式：Executor 在 _remember 显示，Supervisor 在 _save_supervisor_turn 保存后显示；最终回答的普通输出未改。/descriptions 从角色日志只读读取累计 description，不显示轻量工具事件/review 重复摘要，按共享 event_seq 排序和分支前缀过滤，无可靠 event_seq 的旧角色记录不比较各自seq。不新增模型请求、不改变持久化正文。
+
+按用户单独批准，将 AgentLoop/agent.py 的配置类名 cod 恢复为 RuntimeConfig（调用点和测试一直引用 RuntimeConfig），仅修改类名、不改配置字段或 INFORMATION.json。
+
+2026-10-07 历史浏览入口：State/history_browser.py 仅只读枚举 session 下的 chat、按有效分支读取 timeline 问答；没有 branches/checkpoint 的旧 chat_history.jsonl 仅允许 main 查看，不伪造恢复。终端新增 /chats SESSION、/conversation --session SESSION --chat CHAT（每页8000字符）、/open SESSION CHAT [BRANCH]，/history 保留 JSON 视图并支持独立选择 chat、无活跃会话时查看旧 session。/sessions 显示当前存储根；不搜索其他根目录。
+
+/open 是显式切换并复用 resume，不自动执行。直接输入问题始终开始同 chat 新请求，blocked/interrupted 不强制 /continue 或回退；旧未完成请求另记 request_superseded，并保留其 snapshot。/continue 仅显式继续旧目标，/rewind 仅主动回退。conversation_context 合并当前 chat 分支可见 timeline 与 chat_history，按请求/角色避免重复并补齐缺失问答；Supervisor planning 同时收到历史任务及正式成果。不同 chat 不自动混合；历史查询和 task_summary 仍绑定 chat/branch。
+
+State/history_recovery.py 的 history_index.json 仅含旧记录源位置/哈希、导航事件与编号，不重复保存原始正文。session 全局 event_seq 包含所有 chat 的索引保留编号。角色 seq、tool_result_seq 不复用 event_seq。没有 snapshot 的主动回退通过可见前缀重建旧目标，/continue 使用当前配置明确重新规划，不能误跳过到历史任务末尾；没有可靠时间的旧日志标明 inferred_order，不伪称精确执行恢复。源被改变时拒绝；无法区分位置的重复旧记录保守按最晚匹配过滤。原始事实、角色读取和旧 Markdown 均遵守新分支截止边界。
+
 以下是已知边界，不是自动执行指令：
 
 1. 新增 State/session_checkpoint.py：typed dataclass 原子 checkpoint、session 单写者、统一 timeline event_seq、每边界前置 snapshot。CLI 恢复当前阶段，普通成功工具通过原始 locator 只重新总结；checkpoint 滞后时补齐已落盘事实。未知/中断操作不自动重放，需查看真实效果并选安全边界。
 2. 会话路径为 --state-dir 下的精确 session ID，chat/branch 分离。JSONL 保持原文件位置/旧字段，增加 request_id/branch_id/event_seq；tool_result_seq 按整个 session 继续，角色 seq 按 chat 继续，同 chat 新请求 task_id 接在旧任务后。
-3. /rewind 选择 event 或 task_start，创建有 parent/cutoff 的新分支。角色历史、原始事实读取、任务摘要、依赖成果与缓存遵守分支可见范围。原日志不修改，真实文件不回滚，无自动 Git reset。旧日志没有可靠前置 snapshot 时只允许查看，拒绝伪造精确恢复。
-4. 权限由当前 CLI 可信策略决定，不恢复旧 full-access 或批准。默认 workspace-write；read-only 禁止用户项目改写但 Host 可写专用状态；danger-full-access 必须用户显式选择并显示无进程隔离。工作区不得包含 Host 配置/状态后再挂入容器。
-5. Docker Desktop Linux 容器后端只挂选定工作区，不挂 Host 家目录/状态/密钥/socket；默认 network none、只读 rootfs、去 capabilities、资源限制。后端/镜像缺失明确拒绝，不自动拉镜像、不退回无隔离。额外 file roots 只支持可信文件工具，不自动作为容器 mounts；网络仅 on/off，不是域名过滤。配置 tool_capabilities 后外部 MCP 才可能启动/放行，仍不受本地容器自动约束。
+3. /rewind 选择 event 或 task_start，创建有 parent/cutoff 的新分支。角色历史、原始事实读取、任务摘要、依赖成果与缓存遵守分支可见范围。原日志不修改，真实文件不回滚，无自动 Git reset。有 snapshot 精确恢复；无 snapshot 重建历史上下文并明确重新规划，不伪造精确执行状态。
+4. 终端默认未授权；普通工具逐次 yes/no 选择（默认高亮 yes，仍须 Enter 确认），Supervisor 历史查询免确认；副本复制、网络、最终写回独立批准。底层显式 danger-full-access API 保留，但终端不接受此模式或额外根扩权。恢复不继承批准；状态目录不是目标项目。
+5. 终端 Docker 只挂经批准的副本，不挂真实根/状态/密钥/socket；保留 network none、只读 rootfs、低权限与资源限制，无隐式 fallback。网络仅 on/off，外部 MCP 不得成为绕过副本的侧门。
 6. 现有 write_in 的原子覆盖机制继续保存 task_summary.md，checkpoint 复用其 _atomic_write。JSONL、timeline、checkpoint、Markdown 不构成跨文件原子事务；写盘失败时仍须调查最后持久化边界，不声称绝对 exactly-once。
 7. 静态路径检查不能抵御所有恶意并发替换 race；额外 Windows ACL/junction 专项、SDK 在途取消/计费、真实工具链与远端 MCP 的验收仍需单独验证。系统只清理自己创建的进程/容器。
 8. 历史扫描和 snapshot/cache 会随长会话增长，尚无索引/保留策略；不自动删除旧记录。摘要质量和证据冲突解释仍依赖真实模型行为。

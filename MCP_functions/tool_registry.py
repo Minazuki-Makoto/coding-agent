@@ -207,11 +207,29 @@ class ToolRegistry:
 
         return tools
 
+    async def prepare_call(self, role, tool_name, arguments):
+        """Executor cache checks must not read files before one-call approval."""
+        gateway = self.execution_gateway
+        if gateway is None or gateway.per_tool_permissions is not True:
+            return None
+        try:
+            actor = AgentRole(role)
+        except ValueError:
+            return self._error(str(tool_name), "invalid_role", "unknown agent role")
+        if tool_name not in self.host.tool_dictionary:
+            return self._error(tool_name, "unknown_tool", "tool is not registered")
+        if not self._is_allowed(actor, tool_name):
+            return self._error(tool_name, "permission_denied", "role is not allowed to call this tool")
+        if tool_name in SUPERVISOR_ONLY_TOOLS:
+            return None  # Host-bound history never asks terminal authorization.
+        return await gateway.prepare_call(tool_name, arguments, actor.value)
+
     async def call(
             self,
             role:AgentRole | str,
             tool_name:str,
-            arguments:dict[str,Any]
+            arguments:dict[str,Any],
+            *, tool_permission=None,
     ):
         try:
             role = AgentRole(role)
@@ -272,7 +290,7 @@ class ToolRegistry:
             function = getattr(mcp_resources, tool_name, None) or getattr(mcp_supervisor_tools, tool_name)
             output = await function(**arguments)
             return ToolExecutionResult(tool_name, "host_history", True, None, "", output)
-        if self.execution_gateway is not None:
+        if self.execution_gateway is not None and tool_name not in SUPERVISOR_ONLY_TOOLS:
             if run and role == AgentRole.SUPERVISOR:
                 import uuid
                 run.current_operation = uuid.uuid4().hex
@@ -284,6 +302,9 @@ class ToolRegistry:
                     return self._error(tool_name, "client_unavailable", "MCP client unavailable", client_name)
                 raw = await client.call_tool(tool_name=tool_name, argument=arguments)
                 return self._normalize_result(tool_name, client_name, raw)
+            if self.execution_gateway.per_tool_permissions is True:
+                return await self.execution_gateway.call(tool_name, arguments, raw_call,
+                    actor=role.value, tool_permission=tool_permission)
             return await self.execution_gateway.call(tool_name, arguments, raw_call)
 
         client = self.host.session_dictionary.get(client_name)

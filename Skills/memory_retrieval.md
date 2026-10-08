@@ -40,6 +40,14 @@ decision 每轮会收到本轮 Executor output 和 Supervisor evaluation；`hist
 dependency_context 足以支持当前验收时直接使用，不再调用 `read_history_task`，也不能要求综合任务重新读取原文件。
 只有摘要与当前输出矛盾、缺少某个决定性事实，或必须核对原文时，才沿 locator 精确查询。
 
+摘要不是事实白名单。成功目录结果的 evidence_references.paths 可直接证明文件/包存在，
+摘要省略不会使这些前序证据失效；存在性不等于源码职责、构建或运行验证。
+不要因摘要省略就否决；需要正文细节时由 Supervisor 查询原始历史，synthesize 模式的
+Executor 不重新读取项目。未通过的 previous_work 不能作为已验收依据。
+
+历史足够时结束本次阶段：Supervisor 的 is_finished 表示验收/决策已形成，否决也可为 true；
+不是任务通过标志。明确交回 Executor 修正时，不再重复查询或无工具输出 false。
+
 ### 第一步：优先使用 Executor 本轮反馈
 
 先检查 evaluation 输入中已经提供的：

@@ -71,6 +71,12 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 
 ### evaluation 未通过
 
+**控制字段必须分清：`is_finished` 是本次 decision 是否已形成决定，不是任务是否完成。**
+无论接受、否决、要求补充还是交回 Executor 修改，只要已给出明确决定和完整 task_summary，
+就必须 `is_finished=true`。否决的标准组合是 `is_next_target=false, is_finished=true`。
+不能因为 Executor 还要修改就返回 false；否则 Host 会继续请求 Supervisor，Executor 根本收不到修改机会。
+已有明确缺口和下一步时立即结束本次 decision，不反复换措辞、不无工具等待。
+
 当 `executor_is_passed=false` 时：
 
 - `is_next_target` 必须为 `false`；
@@ -79,6 +85,19 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 - 必须保留 accepted_work，不得要求重做已经通过的路径、文件或操作；
 - 应结合失败原因和错误信息说明缺失证据或修复要求；
 - 没有必要调整计划时，`is_task_list_need_change=false`、`new_task_list=[]`。
+
+## 摘要与证据边界
+
+- accepted_summary / verification_summary 是有损累计概括，不是穷尽事实的白名单。
+- 前序已验收 TaskOutcome 的成功 evidence_references 继续有效；例如目录工具的 paths
+  可证明 Dockerfile 或 controller/service/mapper 包存在，即使摘要没有逐项展开。
+- “存在 Dockerfile”不能证明构建或部署成功；文件名不能证明类职责；配置与依赖不能证明
+  所设想的跨服务调用链已执行。按存在性、声明、源码行为、实测结果分别验收。
+- 不得把“摘要没提到”判成“没有证据”，也不得新增“只能写摘要明确列出项”的验收条件。
+- 若具体事实仍不能确认，先利用已有 locator 精确查询原始历史；这不是重新执行工具取证。
+  Supervisor 可查询历史，synthesize 禁止的是 Executor 重读项目或运行工具，不禁止 Supervisor 核查旧证据。
+- previous_work 中未通过的旧回答只是待修改材料，不等于已验收成果。指出具体错误，
+  保留正确部分；推断须明确标注，最终结论也不能把推断重新写成确定事实。
 
 ### evaluation 通过，但只完成当前 task 的一个子目标
 
@@ -136,7 +155,9 @@ decision 不重新执行 Executor 的写入、运行、安装或构建操作，�
 - 工具已经执行但总结失败时，不要重复调用同一工具；
 - 已有 locator 时精确查询该 locator，不读取整段历史；得到足够信息立即停止；
 - not_found、读取失败或被上下文预算省略的内容不能作为任务完成证据；说明缺口并维持必要的验收约束；
-- 若还不能形成决定，输出 `is_finished=false`，但其余必填字段仍要完整提供。
+- 若还不能形成决定，选择一个具体历史查询工具继续；不要无工具地重复 `is_finished=false`。
+  信息确实不可获得时给出明确缺口及下一步，生成完整 task_summary 并以 `is_finished=true`
+  结束本次决策，保持 `is_next_target=false`，不能编造通过结论。
 
 ## 计划调整
 

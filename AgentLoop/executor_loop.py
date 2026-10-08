@@ -1,4 +1,5 @@
 from __future__ import annotations
+from terminal_render import process, show_description
 
 import json
 from pathlib import Path
@@ -24,7 +25,7 @@ from AgentLoop.loop_utils import (
     parse_json_object,
     validate_description,
 )
-from MCP_functions.tool_registry import AgentRole, ToolRegistry
+from MCP_functions.tool_registry import AgentRole, ToolExecutionResult, ToolRegistry
 from State.save_executor_state_history import save_state_history
 from State.save_tool_result import ToolSummary, save_tool_result
 
@@ -50,6 +51,9 @@ EXECUTOR_PROMPT = """
 8. is_finished 判断整个当前 target 是否已满足 completion_criteria，不是判断单次工具是否成功。证据不足时必须为 false；工具无报错不能单独证明完成。
 9. selected_skill 可为 null；若选择，必须对应 skills 中真实 id/name，且 skill 不授予额外工具权限。
 10. description 必须为非空字符串，is_finished 必须是 JSON 布尔值。
+11. dependency_context 中 accepted_summary 是有损概括，不是事实白名单；成功目录证据的 paths 可证明文件或包存在，但不能仅凭文件名认定职责、仅凭 Dockerfile 宣称部署可用、仅凭配置拼出已验证的完整调用链。
+12. previous_work 可能是被否决的旧回答，只用于定位修正；不能照抄其错误结论。综合任务按锁定完成条件交付：直接事实、明确标注的合理推断、未确认边界。不要把合理推断在最终结论中重新写成确定事实。
+13. synthesize 模式没有工具，不要无动作等待或重复生成相同说明。证据不足时用 JSON 明确缺口并 is_finished=false，交给 Supervisor 决定如何补充，而不是自行重读项目。
 
 无工具调用时的唯一输出契约：
 {
@@ -150,7 +154,7 @@ async def run_executor_loop(
     synthesis_tool_attempts = 0
     exit_reason = "executor_step_limit"
 
-    print("====================进入executor执行轮======================")
+    process(f"进入 executor task={now_state.now_task_id} attempt={now_state.task_attempt}", actor="executor")
     if skill_lists and not resuming:
         selected_skill, selection_description = await _select_skill_before_action(
             now_state,
@@ -169,7 +173,7 @@ async def run_executor_loop(
         exit_reason = "executor_reported_finished"
     while steps < now_state.max_executor_steps and not (resuming and not pending_summary and executor_state.is_finished):
         steps += 1
-        print(f"\n\n第{steps}轮")
+        process(f"executor task={now_state.now_task_id} attempt={now_state.task_attempt} 第{steps}轮", actor="executor")
         now_state.executor_executing_times += 1
         try:
             if pending_summary:
@@ -268,9 +272,24 @@ async def run_executor_loop(
                 if output.is_finished:
                     exit_reason = "executor_reported_finished"
                     break
+                if execution_mode == "synthesize":
+                    exit_reason = "executor_synthesis_needs_review"
+                    break
                 continue
 
             tool_call = tool_calls[0]
+            prepared = None
+            operation = None
+            prepare = getattr(tool_registry, "prepare_call", None)
+            if not pending_summary and callable(prepare):
+                if run:
+                    import uuid
+                    operation = uuid.uuid4().hex
+                    run.current_operation = operation
+                    run.emit("tool_intent", "executor", operation_id=operation,
+                             tool_name=tool_call.name, arguments=tool_call.arguments, status="started")
+                prepared = await prepare(AgentRole.EXECUTOR, tool_call.name, tool_call.arguments)
+            preparation_failed = isinstance(prepared, ToolExecutionResult)
             fingerprint = _tool_call_fingerprint(
                 now_state.now_task_id, tool_call.name, tool_call.arguments
             )
@@ -282,13 +301,20 @@ async def run_executor_loop(
                 if reusable_signature in prior_reusable_read_calls
                 else fingerprint
             )
-            if not pending_summary and (
+            if not pending_summary and not preparation_failed and (
                 fingerprint in handoff.get("completed_tool_calls", [])
                 or fingerprint in executor_state.completed_tool_calls
                 or reusable_signature in prior_reusable_read_calls
             ) and not _repeat_is_explicitly_requested(
                 handoff.get("instruction", "")
             ):
+                if prepared is not None:
+                    tool_registry.execution_gateway.consume_permission(
+                        prepared, AgentRole.EXECUTOR.value, tool_call.name, tool_call.arguments)
+                if run and operation:
+                    run.emit("tool_completed", "executor", operation_id=operation,
+                             tool_name=tool_call.name, status="reused", ok=True, executed=False)
+                    run.current_operation = None
                 repeated_completed_calls[duplicate_key] = (
                     repeated_completed_calls.get(duplicate_key, 0) + 1
                 )
@@ -307,10 +333,8 @@ async def run_executor_loop(
                     exit_reason = "executor_repeated_completed_call"
                     break
                 continue
-            operation = None
             if pending_summary:
                 from State.save_tool_result import read_tool_result_record
-                from MCP_functions.tool_registry import ToolExecutionResult
                 raw_record = read_tool_result_record(now_state.session_address, now_state.chat_id,
                                                      pending_summary["tool_result_seq"])
                 if raw_record["status"] != "success":
@@ -319,18 +343,22 @@ async def run_executor_loop(
                 locator = executor_state.last_tool_result_ref
                 pending_summary = None
             else:
-                operation = None
-                if run:
+                if run and not operation:
                     import uuid
                     operation = uuid.uuid4().hex
                     run.current_operation = operation
                     run.emit("tool_intent", "executor", operation_id=operation,
                              tool_name=tool_call.name, arguments=tool_call.arguments, status="started")
-                tool_result = await tool_registry.call(
-                role=AgentRole.EXECUTOR,
-                tool_name=tool_call.name,
-                arguments=tool_call.arguments,
-            )
+                if preparation_failed:
+                    tool_result = prepared
+                else:
+                    call_options = {"tool_permission": prepared} if prepared is not None else {}
+                    tool_result = await tool_registry.call(
+                        role=AgentRole.EXECUTOR,
+                        tool_name=tool_call.name,
+                        arguments=tool_call.arguments,
+                        **call_options,
+                    )
                 now_state.executor_seq += 1
                 executor_state.executor_seq = now_state.executor_seq
                 tool_event_seq = executor_state.executor_seq
@@ -366,6 +394,7 @@ async def run_executor_loop(
                 save_state_history(executor_state, record_type="tool_event")
 
             if tool_result.ok:
+                fingerprint = _tool_call_fingerprint(now_state.now_task_id, tool_call.name, tool_call.arguments)
                 if fingerprint not in executor_state.completed_tool_calls:
                     executor_state.completed_tool_calls.append(fingerprint)
                 _remember_task_evidence(
@@ -721,7 +750,10 @@ def _build_executor_messages(
         "step": time,
         "max_steps": now_state.max_executor_steps,
         "user_query": now_state.user_query,
-        "environment": {"java": now_state.java, "python": now_state.python},
+        "environment": {"java": now_state.java, "python": now_state.python,
+            "project_root": now_state.project_root, "staging_root": now_state.staging_root,
+            "workspace": now_state.staging_root or now_state.project_root,
+            "permission_rule": "Host 运行时授权；真实项目只读，编辑/执行在经批准的副本，写回需单独批准固定变更包"},
         "skills": [
             {"id": item.id, "name": item.name, "description": item.description}
             for item in skill_lists
@@ -794,10 +826,15 @@ def _tool_call_fingerprint(task_id, tool_name, arguments):
 
 
 def _tool_call_signature(tool_name, arguments):
+    from State.project_workspace import WORKSPACE, digest, packed
+    workspace = WORKSPACE.get()
+    scope = workspace.cache_scope(tool_name, arguments) if workspace else None
+    if scope:
+        arguments = scope["arguments"]
     normalized_arguments = json.dumps(
         arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
-    return f"{tool_name}:{normalized_arguments}"
+    return f"{tool_name}:{normalized_arguments}" + (f":workspace={digest(packed(scope))}" if scope else "")
 
 
 def _remember_task_evidence(now_state, latest_tool_context, tool_name, arguments):
@@ -1024,6 +1061,7 @@ def _repeat_is_explicitly_requested(instruction):
 
 
 def _remember(executor_state, description: str):
+    show_description("executor", description, task_id=executor_state.task_id)
     if description:
         executor_state.memory_window.append(description)
 
